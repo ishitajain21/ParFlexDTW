@@ -134,6 +134,8 @@ evaluations_train/
 experiments_train/
 experiments_test/
 
+comparison_notebook.ipynb
+
 error_by_files/
 runtimes/
 *.wav

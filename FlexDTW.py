@@ -13,7 +13,11 @@ from numba import jit
 # In[ ]:
 
 
-pass
+try:
+    get_ipython().run_line_magic('matplotlib', 'inline')
+    get_ipython().run_line_magic('load_ext', 'Cython')
+except NameError:
+    pass
 
 
 # In[ ]:
@@ -188,7 +192,10 @@ def backtrace_flexdtw(D, B, steps, rstart, cstart):
 # In[ ]:
 
 
-pass
+try:
+    get_ipython().run_line_magic('matplotlib', 'inline')
+except NameError:
+    pass
 
 
 # In[ ]:

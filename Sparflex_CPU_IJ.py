@@ -13,7 +13,11 @@
 # Chunk size for tiling the cost matrix. Drives memory/speed tradeoff.
 DEFAULT_CHUNK_LENGTH = 4000
 
-
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMBA_NUM_THREADS"] = "1"
 # In[2]:
 
 
@@ -332,158 +336,341 @@ import gc
 import csv
 import FlexDTW
 
+import time
+import os
+import gc
+import csv
+import math
+from multiprocessing import Pool, cpu_count
 
-def chunk_flexdtw(C, L, steps=None, weights=None, buffer=1, profile_dir='Profiling_results'):
-    """
-    Break cost matrix C into overlapping chunks and run FlexDTW on each.
-    Ensures exactly 1-cell overlap between chunks. Last chunks may be smaller
-    than L×L to maintain the 1-cell overlap constraint.
-    
-    Now stores flexible hop information for each chunk to handle boundary truncation.
-    
-    Parameters:
-    -----------
-    C : ndarray
-        Cost matrix of shape (L1, L2)
-    L : int
-        Standard chunk size
-    steps : list, optional
-        Step patterns for DTW
-    weights : list, optional
-        Weights for each step pattern
-    buffer : int
-        Buffer parameter for FlexDTW
-    profile_dir : str or path-like, optional
-        If set, profile each chunk and write to <profile_dir>/chunk_flexdtw.csv.
-        Columns: chunk_i, chunk_j, start_time, end_time, elapsed_seconds.
+import numpy as np
+import FlexDTW
 
-    Returns:
-    --------
-    chunks_dict : dict
-        Dictionary with minimal per-chunk data: global bounds, shape, edge
-        values for C/D/S, backpointer matrix B, and sparse start-point info.
-    L : int
-        Chunk size
-    n_chunks_1, n_chunks_2 : int
-        Number of chunks in each dimension
+
+# ── Warm-up: called once per worker process at pool startup ──────────────────
+import logging
+import sys
+import traceback
+
+# Set up logging to a file — worker stdout is unreliable
+logging.basicConfig(
+    filename='worker_debug.log',
+    level=logging.DEBUG,
+    format='%(asctime)s [%(process)d] %(message)s'
+)
+
+def _worker_init(steps, weights):
     """
-    import math
+    Pool initializer for the existing implementation that receives precomputed
+    cost-matrix chunks from the main process.
+    """
+    global _STEPS, _WEIGHTS
+    logging.debug("Worker init started")
+    _STEPS = steps
+    _WEIGHTS = weights
+    try:
+        dummy = np.zeros((4, 4), dtype=np.float64)
+        FlexDTW.flexdtw(dummy, steps=steps, weights=weights, buffer=1)
+        logging.debug("Worker init JIT warmup done")
+    except Exception as e:
+        logging.error(f"Worker init failed: {e}\n{traceback.format_exc()}")
+
+
+def _worker_init_with_features(steps, weights, F1_norm, F2_norm):
+    """
+    Pool initializer for the alternative implementation that computes the
+    local chunk cost matrix inside each worker from normalized features.
+    """
+    global _STEPS, _WEIGHTS, _F1N, _F2N
+    logging.debug("Worker init with features started")
+    _STEPS = steps
+    _WEIGHTS = weights
+    _F1N = F1_norm
+    _F2N = F2_norm
+    try:
+        dummy = np.zeros((4, 4), dtype=np.float64)
+        FlexDTW.flexdtw(dummy, steps=steps, weights=weights, buffer=1)
+        logging.debug("Worker init with features JIT warmup done")
+    except Exception as e:
+        logging.error(f"Worker init with features failed: {e}\n{traceback.format_exc()}")
+
+
+# ── Per-chunk worker ─────────────────────────────────────────────────────────
+
+def _process_chunk(args):
+    (i, j, start_1, end_1, start_2, end_2, C_chunk, L1, L2, hop) = args
+    logging.debug(f"Chunk ({i},{j}) started, shape={C_chunk.shape}")
     
+
+
+    t_start = time.perf_counter()
+
+    steps   = _STEPS    # set by _worker_init, no re-pickling needed
+    weights = _WEIGHTS
+
+    try:
+        t_start = time.perf_counter()
+        best_cost, wp, D, P, B, debug = FlexDTW.flexdtw(
+            C_chunk, steps=_STEPS, weights=_WEIGHTS, buffer=1
+        )
+        t_end = time.perf_counter()
+        logging.debug(f"Chunk ({i},{j}) FlexDTW done in {t_end-t_start:.2f}s")
+    except Exception as e:
+        # Without this, the exception vanishes and pool.map hangs or returns None
+        logging.error(f"Chunk ({i},{j}) FAILED: {e}\n{traceback.format_exc()}")
+        raise  # re-raise so pool.map surfaces it
+
+    t_end = time.perf_counter()
+
+    rows, cols = C_chunk.shape
+
+    # Edge extraction — same logic as your sequential version
+    C_row0  = C_chunk[0, :].copy()
+    C_col0  = C_chunk[:, 0].copy()
+    D_top   = D[rows - 1, :].copy()
+    D_right = D[:, cols - 1].copy()
+    S_top   = P[rows - 1, :].copy()
+    S_right = P[:, -1].copy()
+
+    starts_bot_edge, starts_left_edge = _start_points_from_S_edges(S_top, S_right)
+
+    actual_hop_1 = hop if end_1 < L1 else (L1 - start_1)
+    actual_hop_2 = hop if end_2 < L2 else (L2 - start_2)
+
+    chunk_data = {
+        'B': B,
+        'bounds': (start_1, end_1, start_2, end_2),
+        'shape': (rows, cols),
+        'C_edges': {'row0': C_row0, 'col0': C_col0},
+        'D_edges': {0: D_top, 1: D_right},
+        'S_edges': {0: S_top, 1: S_right},
+        'starts_bot_edge': starts_bot_edge,
+        'starts_left_edge': starts_left_edge,
+    }
+
+    timing = (i, j, t_start, t_end, t_end - t_start)
+    return (i, j), chunk_data, timing
+
+def _process_chunk_local_cost(args):
+    """
+    Alternative worker: compute local C_chunk from normalized features
+    and then run FlexDTW on that chunk.
+    Requires globals _F1N, _F2N set by _worker_init_with_features.
+    """
+    (i, j, start_1, end_1, start_2, end_2, L1, L2, hop) = args
+    logging.debug(
+        f"[local_cost] Chunk ({i},{j}) bounds=({start_1}:{end_1}, {start_2}:{end_2})"
+    )
+
+    steps = _STEPS
+    weights = _WEIGHTS
+
+    try:
+        # 1) Build local cost matrix
+        t_cost_start = time.perf_counter()
+        F1_slice = _F1N[:, start_1:end_1]          # shape (d, rows)
+        F2_slice = _F2N[:, start_2:end_2]          # shape (d, cols)
+        C_chunk = 1.0 - F1_slice.T @ F2_slice      # (rows, cols)
+        t_cost_end = time.perf_counter()
+
+        rows, cols = C_chunk.shape
+
+        # 2) Run FlexDTW on this chunk
+        t_dtw_start = time.perf_counter()
+        best_cost, wp, D, P, B, debug = FlexDTW.flexdtw(
+            C_chunk, steps=steps, weights=weights, buffer=1
+        )
+        t_dtw_end = time.perf_counter()
+        logging.debug(
+            f"[local_cost] Chunk ({i},{j}) "
+            f"cost={t_cost_end-t_cost_start:.3f}s flexdtw={t_dtw_end-t_dtw_start:.3f}s"
+        )
+    except Exception as e:
+        logging.error(f"[local_cost] Chunk ({i},{j}) FAILED: {e}\n{traceback.format_exc()}")
+        raise
+
+    # Same edge extraction as _process_chunk
+    C_row0  = C_chunk[0, :].copy()
+    C_col0  = C_chunk[:, 0].copy()
+    D_top   = D[rows - 1, :].copy()
+    D_right = D[:, cols - 1].copy()
+    S_top   = P[rows - 1, :].copy()
+    S_right = P[:, -1].copy()
+
+    starts_bot_edge, starts_left_edge = _start_points_from_S_edges(S_top, S_right)
+
+    actual_hop_1 = hop if end_1 < L1 else (L1 - start_1)
+    actual_hop_2 = hop if end_2 < L2 else (L2 - start_2)
+
+    chunk_data = {
+        'B': B,
+        'bounds': (start_1, end_1, start_2, end_2),
+        'shape': (rows, cols),
+        'C_edges': {'row0': C_row0, 'col0': C_col0},
+        'D_edges': {0: D_top, 1: D_right},
+        'S_edges': {0: S_top, 1: S_right},
+        'starts_bot_edge': starts_bot_edge,
+        'starts_left_edge': starts_left_edge,
+    }
+
+    t_total_start = t_cost_start
+    t_total_end = t_dtw_end
+    timing = (i, j, t_total_start, t_total_end, t_total_end - t_total_start)
+    return (i, j), chunk_data, timing
+# ── Main function ─────────────────────────────────────────────────────────────
+
+def chunk_flexdtw(C, L, steps=None, weights=None, buffer=1,
+                  profile_dir='cpu_imp'):
+
     if steps is None:
         steps = [(1,1), (1,2), (2,1)]
     if weights is None:
         weights = [2, 3, 3]
-    
+
     L1, L2 = C.shape
-    hop = L - 1  # Standard overlap of 1
-    
-    # Compute number of chunks along each axis
+    hop = L - 1
+
     n_chunks_1 = math.ceil((L1 - 1) / hop)
     n_chunks_2 = math.ceil((L2 - 1) / hop)
-    
-    chunks_dict = {}
+    total_chunks = n_chunks_1 * n_chunks_2
+    num_processes = max(1, min(total_chunks, 16))
 
-    # Profiling: open CSV and write header once if requested
-    profile_file = None
-    if profile_dir is not None:
-        os.makedirs(profile_dir, exist_ok=True)
-        profile_file = open(os.path.join(profile_dir, "chunk_flexdtw.csv"), "w", newline="")
-        writer = csv.writer(profile_file)
-        writer.writerow(["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"])
-        profile_file.flush()
-
+    # ── Pre-slice ALL chunks in the main process ──────────────────────────────
+    # Each worker receives a small array, not the full C.
+    # .copy() is important: numpy slices are views; pool.map pickles them,
+    # and pickling a view forces a copy anyway — making it explicit is cleaner.
+    all_args = []
     for i in range(n_chunks_1):
         for j in range(n_chunks_2):
-            if profile_file is not None:
-                gc.collect()
-                t_start = time.perf_counter()
-            # Standard start positions with hop size
             start_1 = i * hop
             start_2 = j * hop
-            
-            # Standard end positions
-            end_1 = start_1 + L
-            end_2 = start_2 + L
-            
-            # For boundary chunks, don't shift start - just truncate end
-            # This ensures we always have exactly 1-frame overlap
-            if end_1 > L1:
-                end_1 = L1
-            
-            if end_2 > L2:
-                end_2 = L2
-            
-            # Extract chunk
-            C_chunk = C[int(start_1):int(end_1), int(start_2):int(end_2)]
+            end_1   = min(start_1 + L, L1)
+            end_2   = min(start_2 + L, L2)
 
-            # Profiling: garbage collect then time this chunk (single-run, good practice)
-            
-            try:
-                best_cost, wp, D, P, B, debug = FlexDTW.flexdtw(
-                    C_chunk,
-                    steps=steps,
-                    weights=weights,
-                    buffer=1
-                )
-            except ImportError:
-                best_cost = 0
-                wp = []
-                D = np.zeros_like(C_chunk)
-                P = np.zeros_like(C_chunk)
-                B = np.zeros_like(C_chunk)
-                debug = {}
-            
+            C_chunk = C[start_1:end_1, start_2:end_2].copy()  # small slice only
 
-            # Calculate actual hop for this chunk
-            # For boundary chunks, the hop to the next chunk may be different
-            actual_hop_1 = hop if end_1 < L1 else (L1 - start_1)
-            actual_hop_2 = hop if end_2 < L2 else (L2 - start_2)
-            
-            
-            # Pre-compute edge views for C, D and S
-            rows, cols = C_chunk.shape
-            C_row0 = C_chunk[0, :].copy()
-            C_col0 = C_chunk[:, 0].copy()
-            D_top = D[rows - 1, :].copy()    # top edge (last row), indexed by column
-            D_right = D[:, cols - 1].copy()  # right edge (last column), indexed by row
-            S_top = P[rows - 1, :].copy()
-            S_right = P[:, -1].copy()
+            all_args.append((
+                i, j,
+                start_1, end_1,
+                start_2, end_2,
+                C_chunk,
+                L1, L2, hop
+            ))
+    print(f"Total chunks: {n_chunks_1 * n_chunks_2}")
+    print(f"Each chunk size: {L}×{L}, dtype={C.dtype}")
+    print(f"Each chunk bytes: {L*L*C.itemsize / 1024:.1f} KB")
+    print(f"Total data being serialized: {n_chunks_1 * n_chunks_2 * L * L * C.itemsize / 1e6:.1f} MB")
+    print(f"Using {num_processes} worker processes for chunked FlexDTW")
+    try:
+        with Pool(
+            processes=num_processes,
+            initializer=_worker_init,
+            initargs=(steps, weights),
+        ) as pool:
+            print("Pool created, dispatching...")
+            sys.stdout.flush()
+            results = pool.map(_process_chunk, all_args, chunksize=1)
+            print("pool.map returned")
+            sys.stdout.flush()
+    except Exception as e:
+        print(f"Pool failed: {e}")
+        traceback.print_exc()
+    print("finished mapping")
+    # ── Reassemble ────────────────────────────────────────────────────────────
+    chunks_dict = {}
+    timings     = []
+    for key, chunk_data, timing in results:
+        chunks_dict[key] = chunk_data
+        timings.append(timing)
+    print("finished reassembling")
+    # ── Write profiling CSV (main process, after all workers done) ────────────
+    if profile_dir is not None:
+        os.makedirs(profile_dir, exist_ok=True)
+        with open(os.path.join(profile_dir, "chunk_flexdtw.csv"), "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"])
+            writer.writerows(timings)
 
-            starts_bot_edge, starts_left_edge = _start_points_from_S_edges(
-                S_top,
-                S_right,
+    return chunks_dict, L, n_chunks_1, n_chunks_2
+def chunk_flexdtw_local_cost(F1, F2, L, steps=None, weights=None, buffer=1,
+                             profile_dir='cpu_imp_local'):
+    """
+    Alternative Stage-1:
+      - does NOT build the full C
+      - computes each chunk's C_chunk in the worker from normalized F1/F2.
+    Returns the same (chunks_dict, L, n_chunks_1, n_chunks_2) structure
+    as chunk_flexdtw so you can plug it into the rest of the pipeline.
+    """
+    if steps is None:
+        steps = [(1, 1), (1, 2), (2, 1)]
+    if weights is None:
+        weights = [2, 3, 3]
+
+    # F1, F2: (dim, T)
+    L1 = F1.shape[1]
+    L2 = F2.shape[1]
+    hop = L - 1
+
+    n_chunks_1 = math.ceil((L1 - 1) / hop)
+    n_chunks_2 = math.ceil((L2 - 1) / hop)
+    total_chunks = n_chunks_1 * n_chunks_2
+    num_processes = max(1, min(total_chunks, 16))
+
+    # Pre-normalize once, share via globals in workers
+    F1_norm = FlexDTW.L2norm(F1)
+    F2_norm = FlexDTW.L2norm(F2)
+
+    all_args = []
+    for i in range(n_chunks_1):
+        for j in range(n_chunks_2):
+            start_1 = i * hop
+            start_2 = j * hop
+            end_1 = min(start_1 + L, L1)
+            end_2 = min(start_2 + L, L2)
+            all_args.append(
+                (i, j, start_1, end_1, start_2, end_2, L1, L2, hop)
             )
 
-            chunks_dict[(i, j)] = {
-                # Backpointer matrix is required for within‑chunk backtrace in Stage 2.
-                'B': B,
-                'bounds': (start_1, end_1, start_2, end_2),
-                'shape': (rows, cols),
-                # Edge-only views of C, D and S
-                'C_edges': {
-                    'row0': C_row0,
-                    'col0': C_col0,
-                },
-                'D_edges': {
-                    0: D_top,    # top edge, indexed by column
-                    1: D_right,  # right edge, indexed by row
-                },
-                'S_edges': {
-                    0: S_top,    # top edge
-                    1: S_right,  # right edge
-                },
-                'starts_bot_edge': starts_bot_edge,
-                'starts_left_edge': starts_left_edge,
-            }
-            if profile_file is not None:
-                t_end = time.perf_counter()
-                writer.writerow([i, j, t_start, t_end, t_end - t_start])
-                profile_file.flush()
+    print(f"[local_cost] Total chunks: {n_chunks_1 * n_chunks_2}")
+    print(f"[local_cost] Nominal chunk size: {L}×{L}")
+    print(f"[local_cost] Using {num_processes} worker processes for chunked FlexDTW")
 
-    if profile_file is not None:
-        profile_file.close()
+    try:
+        from multiprocessing import Pool
+        with Pool(
+            processes=num_processes,
+            initializer=_worker_init_with_features,
+            initargs=(steps, weights, F1_norm, F2_norm),
+        ) as pool:
+            print("[local_cost] Pool created, dispatching...")
+            sys.stdout.flush()
+            results = pool.map(_process_chunk_local_cost, all_args, chunksize=1)
+            print("[local_cost] pool.map returned")
+            sys.stdout.flush()
+    except Exception as e:
+        print(f"[local_cost] Pool failed: {e}")
+        traceback.print_exc()
+        raise
+
+    print("[local_cost] finished mapping")
+
+    chunks_dict = {}
+    timings = []
+    for key, chunk_data, timing in results:
+        chunks_dict[key] = chunk_data
+        timings.append(timing)
+
+    print("[local_cost] finished reassembling")
+
+    if profile_dir is not None:
+        os.makedirs(profile_dir, exist_ok=True)
+        out_path = os.path.join(profile_dir, "chunk_flexdtw_local_cost.csv")
+        with open(out_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"])
+            writer.writerows(timings)
+
     return chunks_dict, L, n_chunks_1, n_chunks_2
-
 
 # In[6]:
 
@@ -584,7 +771,7 @@ def _valid_positions(chunks_dict, i, j, edge_type, edge_len, num_chunks_1, num_c
     return sorted(positions)
 
 
-def initialize_chunks(chunks_dict, num_chunks_1, num_chunks_2, L, profile_dir='Profiling_results'):
+def initialize_chunks(chunks_dict, num_chunks_1, num_chunks_2, L, profile_dir='cpu_imp'):
     """
     Initialize D_chunks and L_chunks for the first row and first column.
     Uses flexible data structure to accommodate non-square boundary chunks.
@@ -837,7 +1024,7 @@ def initialize_chunks(chunks_dict, num_chunks_1, num_chunks_2, L, profile_dir='P
     return D_chunks, L_chunks
 
 
-def dp_fill_chunks(chunks_dict, D_chunks, L_chunks, num_chunks_1, num_chunks_2, L, profile_dir='Profiling_results'):
+def dp_fill_chunks(chunks_dict, D_chunks, L_chunks, num_chunks_1, num_chunks_2, L, profile_dir='cpu_imp'):
     """
     Fill in D_chunks and L_chunks for all interior chunks using dynamic programming.
     Uses flexible hop sizes from chunks_dict.
@@ -1004,56 +1191,56 @@ def chunked_flexdtw(chunks_dict, L, num_chunks_1, num_chunks_2, buffer_param=0.1
 
 import numpy as np
 
-def convert_chunks_to_tiled_result(chunks_dict, L, n_chunks_1, n_chunks_2, C, stage1_params=None):
-    """Convert chunk_flexdtw output to tiled format for plot_parflex_with_chunk_S_background and Stage 2.
+# def convert_chunks_to_tiled_result(chunks_dict, L, n_chunks_1, n_chunks_2, C, stage1_params=None):
+#     """Convert chunk_flexdtw output to tiled format for plot_parflex_with_chunk_S_background and Stage 2.
 
-    The `blocks` entries are intentionally kept minimal; they only store the fields
-    required by downstream functionality (currently visualization).
-    """
-    L1, L2 = C.shape
-    hop = L - 1  # 1-frame overlap
+#     The `blocks` entries are intentionally kept minimal; they only store the fields
+#     required by downstream functionality (currently visualization).
+#     """
+#     L1, L2 = C.shape
+#     hop = L - 1  # 1-frame overlap
 
-    # Convert chunks dictionary to list of block dicts
-    blocks = []
+#     # Convert chunks dictionary to list of block dicts
+#     blocks = []
 
-    for (i, j), chunk_data in chunks_dict.items():
-        # Extract bounds and shape
-        start_1, end_1, start_2, end_2 = chunk_data['bounds']
-        rows, cols = chunk_data['shape']
+#     for (i, j), chunk_data in chunks_dict.items():
+#         # Extract bounds and shape
+#         start_1, end_1, start_2, end_2 = chunk_data['bounds']
+#         rows, cols = chunk_data['shape']
 
-        block_dict = {
-            'bi': i,
-            'bj': j,
-            'rows': (int(start_1), int(end_1)),
-            'cols': (int(start_2), int(end_2)),
-            'Ck_shape': (rows, cols),
-            # Only keep S information along edges; interior is not needed for visualization.
-            'S_edges': chunk_data['S_edges'],
-        }
+#         block_dict = {
+#             'bi': i,
+#             'bj': j,
+#             'rows': (int(start_1), int(end_1)),
+#             'cols': (int(start_2), int(end_2)),
+#             'Ck_shape': (rows, cols),
+#             # Only keep S information along edges; interior is not needed for visualization.
+#             'S_edges': chunk_data['S_edges'],
+#         }
 
-        blocks.append(block_dict)
+#         blocks.append(block_dict)
 
-    # Default stage1 parameters if not provided
-    if stage1_params is None:
-        stage1_params = {
-            'steps': np.array([[1, 1], [1, 2], [2, 1]], dtype=int),
-            'weights': np.array([1.5, 3.0, 3.0], dtype=float),
-            'buffer': 1.0,
-        }
+#     # Default stage1 parameters if not provided
+#     if stage1_params is None:
+#         stage1_params = {
+#             'steps': np.array([[1, 1], [1, 2], [2, 1]], dtype=int),
+#             'weights': np.array([1.5, 3.0, 3.0], dtype=float),
+#             'buffer': 1.0,
+#         }
 
-    # Build the tiled_result dictionary
-    tiled_result = {
-        'C_shape': (L1, L2),
-        'L_block': L,
-        'hop': hop,
-        'n_row': n_chunks_1,
-        'n_col': n_chunks_2,
-        'blocks': blocks,
-        'C': C,
-        'stage1_params': stage1_params,
-    }
+#     # Build the tiled_result dictionary
+#     tiled_result = {
+#         'C_shape': (L1, L2),
+#         'L_block': L,
+#         'hop': hop,
+#         'n_row': n_chunks_1,
+#         'n_col': n_chunks_2,
+#         'blocks': blocks,
+#         'C': C,
+#         'stage1_params': stage1_params,
+#     }
 
-    return tiled_result
+#     return tiled_result
 
 
 # In[8]:
@@ -1123,7 +1310,7 @@ import csv
 import numpy as np
 
 def stage_2_backtrace_compatible(tiled_result, all_blocks, D_chunks, L_chunks, L1, L2,
-                                  L_block, buffer_stage2=200, top_k=1, profile_dir='Profiling_results'):
+                                  L_block, buffer_stage2=200, top_k=1, profile_dir='cpu_imp'):
     """Scan top/right edges for best normalized cost; backtrace and stitch path across chunks. Returns dict with stitched_wp, best_cost, paths_per_segment, etc.
     profile_dir: if set, write to <profile_dir>/stage_2_backtrace_compatible.csv. Rows: top_scan, right_scan, backtrace_stitch (whole backtrace+stitch timed once). Columns: phase, start_time, end_time, elapsed_seconds."""
     
@@ -1738,168 +1925,168 @@ def parflex(C, steps, weights, beta, L=None):
 # In[ ]:
 
 
-import os
-beat_base = '/home/ijain/ttmp/Chopin_Mazurkas/annotations_beat'
-import Parflex
-import import_ipynb
-import DTW
-folder = "Chopin_Op063No3"
-benchmark_dir_full = "/home/ijain/ttmp/Chopin_Mazurkas_features/matching"
+# import os
+# beat_base = '/home/ijain/ttmp/Chopin_Mazurkas/annotations_beat'
+# import Parflex
+# import import_ipynb
+# import DTW
+# folder = "Chopin_Op063No3"
+# benchmark_dir_full = "/home/ijain/ttmp/Chopin_Mazurkas_features/matching"
 
 
-steps = {'dtw1': np.array([1,1,1,2,2,1]).reshape((-1,2)),
-        'dtw2': np.array([1,1,1,2,2,1]).reshape((-1,2)),
-        'dtw3': np.array([1,1,1,2,2,1]).reshape((-1,2)),
-        'subseqdtw1': np.array([1,1,1,2,2,1]).reshape((-1,2)),
-        'subseqdtw2': np.array([1,1,1,2,2,1]).reshape((-1,2)),
-        'subseqdtw3': np.array([1,1,1,2,2,1]).reshape((-1,2)),
-        'nwtw': 0, # transitions are specified in NWTW algorithm
-        'flexdtw': np.array([1,1,1,2,2,1]).reshape((-1,2)), 
-        'parflex': np.array([1,1,1,2,2,1]).reshape((-1,2)),
-        'sparse_parflex': np.array([1,1,1,2,2,1]).reshape((-1,2))
-        }
-weights = {'dtw1': np.array([2,3,3]),
-          'dtw2': np.array([1,1,1]),
-          'dtw3': np.array([1,2,2]),
-          'subseqdtw1': np.array([1,1,2]),
-          'subseqdtw2': np.array([2,3,3]),
-          'subseqdtw3': np.array([1,2,2]),
-          'nwtw': 0, # weights are specified in NWTW algorithm
-          'flexdtw': np.array([1.25,3,3]),
-          'parflex': np.array([1.25,3.0,3.0]),
-          'sparse_parflex': np.array([1.25,3.0,3.0])
-          }
-other_params = {
-                'flexdtw': {'beta': 0.1}, 
-                'parflex': {'beta': 0.1},
-                'sparse_parflex': {'beta': 0.1}
-               }
-file_1 = "/home/ijain/ttmp/Chopin_Mazurkas_features/matching/Chopin_Op063No3/Chopin_Op063No3_Francois-1956_pid9070b-24.npy"
-file_2 = "/home/ijain/ttmp/Chopin_Mazurkas_features/matching/Chopin_Op063No3/Chopin_Op063No3_Michalowski-1933_pid9083-16.npy"
-beat_1 = beat_base + "/" + folder + "/Chopin_Op063No3_Francois-1956_pid9070b-24.beat"
-beat_2 = beat_base + "/" + folder  + "/Chopin_Op063No3_Michalowski-1933_pid9083-16.beat"
+# steps = {'dtw1': np.array([1,1,1,2,2,1]).reshape((-1,2)),
+#         'dtw2': np.array([1,1,1,2,2,1]).reshape((-1,2)),
+#         'dtw3': np.array([1,1,1,2,2,1]).reshape((-1,2)),
+#         'subseqdtw1': np.array([1,1,1,2,2,1]).reshape((-1,2)),
+#         'subseqdtw2': np.array([1,1,1,2,2,1]).reshape((-1,2)),
+#         'subseqdtw3': np.array([1,1,1,2,2,1]).reshape((-1,2)),
+#         'nwtw': 0, # transitions are specified in NWTW algorithm
+#         'flexdtw': np.array([1,1,1,2,2,1]).reshape((-1,2)), 
+#         'parflex': np.array([1,1,1,2,2,1]).reshape((-1,2)),
+#         'sparse_parflex': np.array([1,1,1,2,2,1]).reshape((-1,2))
+#         }
+# weights = {'dtw1': np.array([2,3,3]),
+#           'dtw2': np.array([1,1,1]),
+#           'dtw3': np.array([1,2,2]),
+#           'subseqdtw1': np.array([1,1,2]),
+#           'subseqdtw2': np.array([2,3,3]),
+#           'subseqdtw3': np.array([1,2,2]),
+#           'nwtw': 0, # weights are specified in NWTW algorithm
+#           'flexdtw': np.array([1.25,3,3]),
+#           'parflex': np.array([1.25,3.0,3.0]),
+#           'sparse_parflex': np.array([1.25,3.0,3.0])
+#           }
+# other_params = {
+#                 'flexdtw': {'beta': 0.1}, 
+#                 'parflex': {'beta': 0.1},
+#                 'sparse_parflex': {'beta': 0.1}
+#                }
+# file_1 = "/home/ijain/ttmp/Chopin_Mazurkas_features/matching/Chopin_Op063No3/Chopin_Op063No3_Francois-1956_pid9070b-24.npy"
+# file_2 = "/home/ijain/ttmp/Chopin_Mazurkas_features/matching/Chopin_Op063No3/Chopin_Op063No3_Michalowski-1933_pid9083-16.npy"
+# beat_1 = beat_base + "/" + folder + "/Chopin_Op063No3_Francois-1956_pid9070b-24.beat"
+# beat_2 = beat_base + "/" + folder  + "/Chopin_Op063No3_Michalowski-1933_pid9083-16.beat"
  
-print(beat_1)
-print(beat_2)
+# print(beat_1)
+# print(beat_2)
 
 
-try:
-    steps
-except NameError:
-    steps = {"flexdtw": np.array([[1, 1], [1, 2], [2, 1]], dtype=int)}
+# try:
+#     steps
+# except NameError:
+#     steps = {"flexdtw": np.array([[1, 1], [1, 2], [2, 1]], dtype=int)}
 
-try:
-    weights
-except NameError:
-    weights = {"flexdtw": np.array([1.25, 3.0, 3.0], dtype=float)}
+# try:
+#     weights
+# except NameError:
+#     weights = {"flexdtw": np.array([1.25, 3.0, 3.0], dtype=float)}
 
-try:
-    other_params
-except NameError:
-    other_params = {"flexdtw": {"beta": 0.1}}
+# try:
+#     other_params
+# except NameError:
+#     other_params = {"flexdtw": {"beta": 0.1}}
 
-# Load the files
-F1 = np.load(file_1, allow_pickle=True)
-F2 = np.load(file_2, allow_pickle=True)
+# # Load the files
+# F1 = np.load(file_1, allow_pickle=True)
+# F2 = np.load(file_2, allow_pickle=True)
 
-L1 = F1.shape[1]
-L2 = F2.shape[1]
+# L1 = F1.shape[1]
+# L2 = F2.shape[1]
  
-# ----------------- GLOBAL FLEXDTW PATH -----------------
-C_full = 1.0 - FlexDTW.L2norm(F1).T @ FlexDTW.L2norm(F2)
-buffer_flex = min(L1, L2) * (1 - (1 - other_params['flexdtw']['beta']) * min(L1, L2) / max(L1, L2))
-# print(buffer_flex)
-best_cost_full, global_flex_path, D, P, B, debug = FlexDTW.flexdtw(
-    C_full,
-    steps=steps['flexdtw'],
-    weights=weights['flexdtw'],
-    buffer=buffer_flex,
-)
-S = P  # P is the start encoding (used for grey start→endpoint background)
-# print(f"Global FlexDTW path shape: {global_flex_path.shape}")
+# # ----------------- GLOBAL FLEXDTW PATH -----------------
+# C_full = 1.0 - FlexDTW.L2norm(F1).T @ FlexDTW.L2norm(F2)
+# buffer_flex = min(L1, L2) * (1 - (1 - other_params['flexdtw']['beta']) * min(L1, L2) / max(L1, L2))
+# # print(buffer_flex)
+# best_cost_full, global_flex_path, D, P, B, debug = FlexDTW.flexdtw(
+#     C_full,
+#     steps=steps['flexdtw'],
+#     weights=weights['flexdtw'],
+#     buffer=buffer_flex,
+# )
+# S = P  # P is the start encoding (used for grey start→endpoint background)
+# # print(f"Global FlexDTW path shape: {global_flex_path.shape}")
 
-# FlexDTW plot: grey = possible starts per global endpoint, black = selected path, dotted grid like Parflex
-# FlexDTW plot overlays:
-# - grey = possible starts per global endpoint (from P)
-# - black = selected global FlexDTW path
-# (chunk-based overlays are drawn after we build chunks via Parflex stage-1)
-# sparse_parflex.plot_flex_with_global_S_background(
-#     C_global=C_full,
-#     flex_wp=global_flex_path,
-#     S=S,
-#     L_div=4000,
-#     title="Global FlexDTW with S-based start→endpoint background",
+# # FlexDTW plot: grey = possible starts per global endpoint, black = selected path, dotted grid like Parflex
+# # FlexDTW plot overlays:
+# # - grey = possible starts per global endpoint (from P)
+# # - black = selected global FlexDTW path
+# # (chunk-based overlays are drawn after we build chunks via Parflex stage-1)
+# # sparse_parflex.plot_flex_with_global_S_background(
+# #     C_global=C_full,
+# #     flex_wp=global_flex_path,
+# #     S=S,
+# #     L_div=4000,
+# #     title="Global FlexDTW with S-based start→endpoint background",
+# # )
+
+
+# # ----------------- PARFLEX -----------------
+
+# C, tiled_result = Parflex.align_system_parflex(
+#     F1,
+#     F2,
+#     steps=steps['flexdtw'],
+#     weights=weights['flexdtw'],
+#     beta=other_params['flexdtw']['beta'],
+# )
+
+# # print("\n" + "=" * 80)
+# # print("STAGE 1 COMPLETE - TESTING RESULTS")
+# # print("=" * 80)
+
+# stage2_result_parflex = Parflex.parflex_2a(
+#     tiled_result,
+#     C,
+#     beta=other_params['flexdtw']['beta'],
+#     show_fig=False,
+#     top_k=1,
 # )
 
 
-# ----------------- PARFLEX -----------------
+# # Aligning system sparse parflex:
+# C, tiled_result = align_system_sparse_parflex(
+#     F1,
+#     F2,
+#     steps=steps['flexdtw'],
+#     weights=weights['flexdtw'],
+#     beta=other_params['flexdtw']['beta'],
+# )
+# # print(f"Number of chunks: {tiled_result['n_row']}×{tiled_result['n_col']}")
 
-C, tiled_result = Parflex.align_system_parflex(
-    F1,
-    F2,
-    steps=steps['flexdtw'],
-    weights=weights['flexdtw'],
-    beta=other_params['flexdtw']['beta'],
-)
+# # print("\n" + "=" * 80)
+# # print("STAGE 1 COMPLETE - TESTING RESULTS")
+# # print("=" * 80)
 
-# print("\n" + "=" * 80)
-# print("STAGE 1 COMPLETE - TESTING RESULTS")
-# print("=" * 80)
+# stage2_result_sparse = sparse_parflex_2a(
+#     tiled_result,
+#     C,
+#     beta=other_params['flexdtw']['beta'],
+#     show_fig=False,
+#     top_k=1,
+# )
 
-stage2_result_parflex = Parflex.parflex_2a(
-    tiled_result,
-    C,
-    beta=other_params['flexdtw']['beta'],
-    show_fig=False,
-    top_k=1,
-)
-
-
-# Aligning system sparse parflex:
-C, tiled_result = align_system_sparse_parflex(
-    F1,
-    F2,
-    steps=steps['flexdtw'],
-    weights=weights['flexdtw'],
-    beta=other_params['flexdtw']['beta'],
-)
-# print(f"Number of chunks: {tiled_result['n_row']}×{tiled_result['n_col']}")
-
-# print("\n" + "=" * 80)
-# print("STAGE 1 COMPLETE - TESTING RESULTS")
-# print("=" * 80)
-
-stage2_result_sparse = sparse_parflex_2a(
-    tiled_result,
-    C,
-    beta=other_params['flexdtw']['beta'],
-    show_fig=False,
-    top_k=1,
-)
-
-# compare numberically stage2_result_sparse and stage2_result_parflex's ['stitched_wp']
-# comparisons = np.allclose(stage2_result_sparse['stitched_wp'], stage2_result_parflex['stitched_wp'])
-# # print(comparisons)
-import DTW
-dtw_systems = ['dtw1', 'dtw2', 'dtw3']
-dtw_paths = {}
-for system in dtw_systems:
-    wp = DTW.alignDTW(
-        C,
-        steps=steps[system],
-        weights=weights[system],
-        downsample=1,
-        outfile=None,
-        subseq=False,
-    )
-    dtw_paths[system] = wp
+# # compare numberically stage2_result_sparse and stage2_result_parflex's ['stitched_wp']
+# # comparisons = np.allclose(stage2_result_sparse['stitched_wp'], stage2_result_parflex['stitched_wp'])
+# # # print(comparisons)
+# import DTW
+# dtw_systems = ['dtw1', 'dtw2', 'dtw3']
+# dtw_paths = {}
+# for system in dtw_systems:
+#     wp = DTW.alignDTW(
+#         C,
+#         steps=steps[system],
+#         weights=weights[system],
+#         downsample=1,
+#         outfile=None,
+#         subseq=False,
+#     )
+#     dtw_paths[system] = wp
  
-print(f"FlexDTW path: {global_flex_path.shape[1]} pts | Chunks: {tiled_result['n_row']}×{tiled_result['n_col']}")
-plot_parflex_with_chunk_S_background(tiled_result, C, global_flex_path, stage2_result_sparse, ground_truth_=(beat_1, beat_2),
-    extra_paths=dtw_paths,)
+# print(f"FlexDTW path: {global_flex_path.shape[1]} pts | Chunks: {tiled_result['n_row']}×{tiled_result['n_col']}")
+# plot_parflex_with_chunk_S_background(tiled_result, C, global_flex_path, stage2_result_sparse, ground_truth_=(beat_1, beat_2),
+#     extra_paths=dtw_paths,)
 
 
-# In[ ]:
+# # In[ ]:
 
 
 

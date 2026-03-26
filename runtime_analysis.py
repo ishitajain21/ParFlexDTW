@@ -18,7 +18,7 @@ os.environ['NUMEXPR_NUM_THREADS'] = '1'
 os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
 
 import Parflex
-import Sparse_parflex_cpu          # sparse variant with per-chunk profiling
+import runtime_for_sparflex          # sparse variant with per-chunk profiling
 import FlexDTW
 import numpy as np
 from pathlib import Path
@@ -33,7 +33,7 @@ OUTPUT_DIR = Path("/home/ijain/parflex/symphony_of_tears_features")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Directory that will hold per-run profiling sub-directories.
-PROFILE_ROOT = OUTPUT_DIR / "profiling"
+PROFILE_ROOT = OUTPUT_DIR / "results_profiling"
 PROFILE_ROOT.mkdir(exist_ok=True)
 
 # %%
@@ -69,7 +69,7 @@ weights = np.array([1.5, 3.0, 3.0], dtype=float)
 beta    = 0.1
 
 # %%
-P_VALUES = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]
+P_VALUES = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 60000,70000,80000]
 
 F1 = np.load(OUTPUT_DIR / "PMLP118441-Armenia_performance.npy")
 F2 = np.load(OUTPUT_DIR / "PMLP118441-New_Disc_-01-_Track_01.npy")
@@ -85,58 +85,96 @@ if _write_header:
     _csv_writer.writerow(_CSV_HEADER)
     _results_fh.flush()
 
+def _already_done(profile_dir, sentinel_file):
+    """Return True if the experiment directory exists and contains the sentinel output file."""
+    return (profile_dir / sentinel_file).exists()
+
+
 for current_p in P_VALUES:
     if current_p > max_p:
         print(f"Skipping P={current_p}: only {max_p} frames available")
         continue
 
-    # Build the square PxP Euclidean cost matrix for the first current_p frames.
+    # Build the square PxP cost matrix once per P (shared across all trials/L values).
     X  = F1[:, :current_p].T
     Y  = F2[:, :current_p].T
     x2 = np.sum(X * X, axis=1, keepdims=True)
     y2 = np.sum(Y * Y, axis=1, keepdims=True).T
     C  = np.sqrt(np.maximum(x2 + y2 - 2.0 * (X @ Y.T), 0.0))
 
+    _dense_plot_data = {}  # l_val → plot_data dict from the last trial
+
     for trial in range(1, N_TRIALS + 1):
-
-        # ---- FlexDTW (no chunking; L=nan) --------------------------------
-        gc.collect()
-        t_start = time.perf_counter()
-        dist    = FlexDTW.flexdtw(C, steps, weights)
-        elapsed = time.perf_counter() - t_start
-
-        _csv_writer.writerow(["FlexDTW", current_p, "", trial, elapsed, dist])
-        _results_fh.flush()
-
-        # ---- Dense Parflex and Sparse Parflex for each chunk length -------
         for l_val in L_VALUES:
 
-            # Unique sub-directory keeps each run's profiling CSVs separate,
-            # preventing overwrite when the same (P, L) is benchmarked again.
-            dense_profile_dir  = PROFILE_ROOT / f"dense_P{current_p}_L{l_val}_trial{trial}"
-            sparse_profile_dir = PROFILE_ROOT / f"sparse_P{current_p}_L{l_val}_trial{trial}"
+            flexdtw_profile_dir = PROFILE_ROOT / f"flexdtw_P{current_p}_L{l_val}_trial{trial}"
+            dense_profile_dir   = PROFILE_ROOT / f"dense_P{current_p}_L{l_val}_trial{trial}"
+            sparse_profile_dir  = PROFILE_ROOT / f"sparse_P{current_p}_L{l_val}_trial{trial}"
 
-            # -- Dense Parflex ----------------------------------------------
+            # -- FlexDTW (full matrix, no chunking) ----------------------------
+            if _already_done(flexdtw_profile_dir, "flexdtw_runtime.csv"):
+                print(f"  Skipping {flexdtw_profile_dir.name}")
+            else:
+                flexdtw_profile_dir.mkdir(parents=True, exist_ok=True)
+                gc.collect()
+                t_start = time.perf_counter()
+                dist    = FlexDTW.flexdtw(C, steps, weights)
+                elapsed = time.perf_counter() - t_start
+
+                with open(flexdtw_profile_dir / "flexdtw_runtime.csv", "w", newline="") as _f:
+                    _w = csv.writer(_f)
+                    _w.writerow(["start_time", "end_time", "elapsed_seconds"])
+                    _w.writerow([t_start, t_start + elapsed, elapsed])
+
+                _csv_writer.writerow(["FlexDTW", current_p, l_val, trial, elapsed, dist])
+                _results_fh.flush()
+
+            # -- Dense Parflex -------------------------------------------------
+            if _already_done(dense_profile_dir, "chunk_flexdtw.csv"):
+                print(f"  Skipping {dense_profile_dir.name}")
+            else:
+                gc.collect()
+                t_start       = time.perf_counter()
+                is_last_trial = (trial == N_TRIALS)
+                if is_last_trial:
+                    dist, _wp, _plot_data = Parflex.parflex(
+                        C, steps, weights, beta, l_val,
+                        profile_dir=str(dense_profile_dir),
+                        return_plot_data=True,
+                    )
+                    _dense_plot_data[l_val] = _plot_data
+                else:
+                    dist, _wp = Parflex.parflex(C, steps, weights, beta, l_val,
+                                                profile_dir=str(dense_profile_dir))
+                elapsed = time.perf_counter() - t_start
+
+                _csv_writer.writerow(["ParFlexDTW_dense_serial", current_p, l_val, trial, elapsed, dist])
+                _results_fh.flush()
+
+            # -- Sparse Parflex ------------------------------------------------
+            if _already_done(sparse_profile_dir, "chunk_flexdtw.csv"):
+                print(f"  Skipping {sparse_profile_dir.name}")
+            else:
+                gc.collect()
+                t_start = time.perf_counter()
+                dist    = runtime_for_sparflex.parflex(C, steps, weights, beta, l_val,
+                                                       profile_dir=str(sparse_profile_dir))
+                elapsed = time.perf_counter() - t_start
+
+                _csv_writer.writerow(["ParFlexDTW_sparse_serial", current_p, l_val, trial, elapsed, dist])
+                _results_fh.flush()
+
             gc.collect()
-            t_start  = time.perf_counter()
-            dist     = Parflex.parflex(C, steps, weights, beta, l_val,
-                                       profile_dir=str(dense_profile_dir))
-            elapsed  = time.perf_counter() - t_start
 
-            _csv_writer.writerow(["ParFlexDTW_dense_serial", current_p, l_val, trial, elapsed, dist])
-            _results_fh.flush()
-
-            # -- Sparse Parflex --------------------------------------------
-            gc.collect()
-            t_start  = time.perf_counter()
-            dist     = Sparse_parflex_cpu.parflex(C, steps, weights, beta, l_val,
-                                                  profile_dir=str(sparse_profile_dir))
-            elapsed  = time.perf_counter() - t_start
-
-            _csv_writer.writerow(["ParFlexDTW_sparse_serial", current_p, l_val, trial, elapsed, dist])
-            _results_fh.flush()
-
-            gc.collect()
+    # Save one plot per (P, L) using the last trial's dense parflex intermediate data.
+    for l_val, plot_data in _dense_plot_data.items():
+        save_path = OUTPUT_DIR / f"plot_P{current_p}_L{l_val}.html"
+        Parflex.plot_parflex_with_chunk_S_background(
+            plot_data['tiled_result'], plot_data['C'],
+            flex_wp=None, parflex_res=plot_data['parflex_res'],
+            save_path=str(save_path),
+        )
+        print(f"  Saved plot: {save_path}")
 
     print(f"Completed P={current_p}")
 
@@ -160,3 +198,4 @@ runtime_summary_df.to_csv(SUMMARY_PATH, index=False)
 
 print(f"Saved trial runtimes to:      {RESULTS_PATH}")
 print(f"Saved average/stdev summary to: {SUMMARY_PATH}")
+

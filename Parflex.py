@@ -39,7 +39,8 @@ import plotly.graph_objects as go
 
 
 def plot_parflex_with_chunk_S_background(tiled_result, C_global, flex_wp, parflex_res, xy=None,
-                                         chunk_length=None, use_valid_edges_only=True):
+                                         chunk_length=None, use_valid_edges_only=True,
+                                         save_path=None):
     """
     Plot FlexDTW vs ParFlex paths. Background: chunk S start→edge segments (global coords).
     Foreground: global FlexDTW path, ParFlex stitched path, best-per-segment paths.
@@ -146,26 +147,26 @@ def plot_parflex_with_chunk_S_background(tiled_result, C_global, flex_wp, parfle
                 line=dict(width=3, color="rgba(0,128,255,0.5)")
             )
         )
-    flex_wp = np.asarray(flex_wp)
-
-    if flex_wp.shape[1] == 2:
-        f1_frames = flex_wp[:, 0]
-        f2_frames = flex_wp[:, 1]
-    elif flex_wp.shape[0] == 2:
-        f1_frames = flex_wp[0, :]
-        f2_frames = flex_wp[1, :]
-    else:
-        raise ValueError(f"Unexpected flex_wp shape: {flex_wp.shape}")
-
-    fig.add_trace(
-        go.Scattergl(
-            x=f2_frames,
-            y=f1_frames,
-            mode="lines",
-            name="Global FlexDTW",
-            line=dict(width=4, color="rgba(0,0,0,1)")
-        )
-    )
+    if flex_wp is not None:
+        flex_wp = np.asarray(flex_wp)
+        if flex_wp.size > 0:
+            if flex_wp.ndim == 2 and flex_wp.shape[1] == 2:
+                f1_frames = flex_wp[:, 0]
+                f2_frames = flex_wp[:, 1]
+            elif flex_wp.ndim == 2 and flex_wp.shape[0] == 2:
+                f1_frames = flex_wp[0, :]
+                f2_frames = flex_wp[1, :]
+            else:
+                raise ValueError(f"Unexpected flex_wp shape: {flex_wp.shape}")
+            fig.add_trace(
+                go.Scattergl(
+                    x=f2_frames,
+                    y=f1_frames,
+                    mode="lines",
+                    name="Global FlexDTW",
+                    line=dict(width=4, color="rgba(0,0,0,1)")
+                )
+            )
     if xy is not None:
         xy_arr = np.asarray(xy)
 
@@ -215,7 +216,10 @@ def plot_parflex_with_chunk_S_background(tiled_result, C_global, flex_wp, parfle
             line=dict(width=1, dash="dot")
         ))
     fig.update_layout(shapes=shapes)
-    fig.show()
+    if save_path is not None:
+        fig.write_html(str(save_path), include_plotlyjs="cdn", full_html=True)
+    else:
+        fig.show()
 
 
 # In[ ]:
@@ -234,7 +238,7 @@ def plot_parflex_with_chunk_S_background(tiled_result, C_global, flex_wp, parfle
 import numpy as np
 
  
-def chunk_flexdtw(C, L, steps=None, weights=None, buffer=1, profile_dir='Profiling_results'):
+def chunk_flexdtw(C, L, steps=None, weights=None, buffer=1, profile_dir='results_profiling'):
     """
     Tile cost matrix C into overlapping L×L chunks (1-cell overlap), run FlexDTW on each.
     Returns chunks_dict keyed by (i, j) with 'C', 'D', 'S', 'B', 'bounds', 'hop', 'shape', etc.
@@ -371,7 +375,7 @@ def global_to_prev_chunk_edge(global_row, global_col, prev_chunk_i, prev_chunk_j
     raise ValueError(f"({local_row}, {local_col}) not on edge of previous chunk")
 
 
-def initialize_chunks(chunks_dict, num_chunks_1, num_chunks_2, L, profile_dir='Profiling_results'):
+def initialize_chunks(chunks_dict, num_chunks_1, num_chunks_2, L, profile_dir='results_profiling'):
     """
     Initialize D_chunks and L_chunks for the first row and first column of the chunk grid.
 
@@ -581,7 +585,7 @@ def initialize_chunks(chunks_dict, num_chunks_1, num_chunks_2, L, profile_dir='P
 
 
 def dp_fill_chunks(chunks_dict, D_chunks, L_chunks, num_chunks_1, num_chunks_2, L,
-                   profile_dir='Profiling_results'):
+                   profile_dir='results_profiling'):
     """
     Fill D_chunks and L_chunks for all interior chunks (i>0, j>0) using DP.
 
@@ -719,7 +723,7 @@ def dp_fill_chunks(chunks_dict, D_chunks, L_chunks, num_chunks_1, num_chunks_2, 
         profile_file.close()
     return D_chunks, L_chunks
 def chunked_flexdtw(chunks_dict, L, num_chunks_1, num_chunks_2, buffer_param=0.1,
-                    profile_dir='Profiling_results'):
+                    profile_dir='results_profiling'):
     """Propagate cost/length on chunk edges: init first row/col, then DP fill. Returns (D_chunks, L_chunks)."""
     D_chunks, L_chunks = initialize_chunks(
         chunks_dict, num_chunks_1, num_chunks_2, L, profile_dir=profile_dir
@@ -824,7 +828,7 @@ import numpy as np
 
 def stage_2_backtrace_compatible(tiled_result, all_blocks, D_chunks, L_chunks, L1, L2,
                                   L_block, buffer_stage2=200, top_k=1,
-                                  profile_dir='Profiling_results'):
+                                  profile_dir='results_profiling'):
     """
     Scan top/right global edges for the best normalised cost endpoint, then backtrace
     and stitch a path across chunks.
@@ -1399,7 +1403,7 @@ def align_system_parflex(F1, F2, steps=None, weights=None, beta=0.1, L=None):
 
 
 def parflex_2a(tiled_result, C, beta=0.1, show_fig=False, top_k=1,
-               profile_dir='Profiling_results'):
+               profile_dir='results_profiling'):
     """
     Run Parflex Stage 2: propagate costs across chunk edges and backtrace the best path.
 
@@ -1430,7 +1434,8 @@ def parflex_2a(tiled_result, C, beta=0.1, show_fig=False, top_k=1,
 # In[10]:
 
 
-def parflex(C, steps, weights, beta, L=None, profile_dir='Profiling_results'):
+def parflex(C, steps, weights, beta, L=None, profile_dir='results_profiling',
+            return_plot_data=False):
     """
     Run full Parflex pipeline on cost matrix C.
 
@@ -1442,6 +1447,9 @@ def parflex(C, steps, weights, beta, L=None, profile_dir='Profiling_results'):
         Each call writes fresh CSVs, so pass a unique directory per run when calling
         in a loop (e.g. profile_dir='runs/P1000_L500_trial3').
         Pass None to disable all profiling.
+    return_plot_data : bool
+        If True, also return a dict with keys 'tiled_result', 'parflex_res', 'C'
+        needed to call plot_parflex_with_chunk_S_background. Default False.
     """
     if L is None:
         L = DEFAULT_CHUNK_LENGTH
@@ -1459,6 +1467,7 @@ def parflex(C, steps, weights, beta, L=None, profile_dir='Profiling_results'):
     tiled_result = convert_chunks_to_tiled_result(
         chunks_dict, L_out, n_chunks_1, n_chunks_2, C, stage1_params=stage1_params
     )
+    tiled_result['chunks_dict'] = chunks_dict
 
     # Stage 2: propagate edge costs and backtrace.
     D_chunks, L_chunks = chunked_flexdtw(
@@ -1475,6 +1484,9 @@ def parflex(C, steps, weights, beta, L=None, profile_dir='Profiling_results'):
         wp = wp.T  # (N, 2) → (2, N)
     else:
         wp = np.array([[], []], dtype=np.int64)
+
+    if return_plot_data:
+        return r["best_cost"], wp, {'tiled_result': tiled_result, 'parflex_res': r, 'C': C}
     return r["best_cost"], wp
 
 
