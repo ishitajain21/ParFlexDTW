@@ -1,5 +1,5 @@
 """
-Config for running Sparse_Parflex.ipynb for multiple L and saving to experiments_train.
+Config for running Parflex.ipynb for multiple L and saving under EXPERIMENTS_TRAIN_ROOT.
 Do not run the sweep here; this file only defines constants.
 """
 
