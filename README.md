@@ -44,19 +44,6 @@ Run the notebooks **in order** (each may depend on outputs of the previous ones)
 | 5 | **05_Evaluate_Benchmarks.ipynb** | Evaluate alignment results (e.g. for different chunk sizes **L**). |
 
 Execute them in Jupyter/Lab or with `jupyter nbconvert --to notebook --execute <notebook>.ipynb` as needed.
-
----
-
-## Running notebook 04 from the terminal
-
-To run **04_Align_Benchmarks.ipynb** non-interactively (e.g. on a server), use the provided script:
-
-```bash
-./run_workflow.sh
-```
-
-This runs the notebook in the background with the `mir` environment, no timeout, and logs to `run.log`. Adjust the script if you need a different environment or log path.
-
 ---
 
 ## Trying different values of L
