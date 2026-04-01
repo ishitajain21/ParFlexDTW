@@ -9,9 +9,10 @@ This repository implements **Sparse Parallel FlexDTW** (ParFlex): a chunk-based,
 - The cost matrix is split into **overlapping chunks** of length **L** (chunk size). Each chunk is aligned with FlexDTW independently, then boundaries are synchronized and the best path is stitched across chunks.
 - **L** is the main tuning parameter: larger L uses more memory per chunk but can reduce overhead; smaller L reduces memory at the cost of more chunks and more stitching.
 - The notebook provides:
-  - **`parflex(C, steps, weights, beta, L=None)`** — one-shot: build cost matrix, run chunked FlexDTW, and stitch.
-  - **`align_system_sparse_parflex(F1, F2, ...)`** — Stage 1 only: build cost matrix and run chunked FlexDTW (returns `C` and tiled result for Stage 2 or visualization).
-  - Helpers for visualization (e.g. FlexDTW vs ParFlex paths) and conversion between chunk outputs and global coordinates.
+  - **`parflex(C, steps, weights, beta, L=None)`** — one-shot alignment on a precomputed cost matrix `C` (chunked FlexDTW plus stage-2 scan and stitch).
+  - **`tiled_stage1_from_features(F1, F2, ...)`** — stage 1 only: build `C` from feature matrices, run FlexDTW on tiles, return `C` and a tiled structure (for stage 2, plots, or sparsity analysis).
+  - **`run_stage2_from_tiled(...)`** — stage 2 only when stage 1 was run separately.
+  - Plotting and coordinate helpers (e.g. **`plot_alignment_with_tile_background`**).
 
 The rest of the repo is a **pipeline** (notebooks 01–05) that prepares data, runs alignment with this method, and evaluates results.
 
@@ -40,7 +41,7 @@ Run the notebooks **in order** (each may depend on outputs of the previous ones)
 | 2 | **02_Make_Train_Test_Set.ipynb** | Build train/test splits. |
 | 3 | **03_DataPrep.ipynb** | Data preparation for alignment. |
 | 4 | **04_Align_Benchmarks.ipynb** | Run alignment (uses Sparse Parflex / FlexDTW). |
-| 5 | **05_Evaluate_Benchmarks_L.ipynb** | Evaluate alignment results (e.g. for different L). |
+| 5 | **05_Evaluate_Benchmarks.ipynb** | Evaluate alignment results (e.g. for different chunk sizes **L**). |
 
 Execute them in Jupyter/Lab or with `jupyter nbconvert --to notebook --execute <notebook>.ipynb` as needed.
 

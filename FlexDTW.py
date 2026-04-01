@@ -3,24 +3,21 @@
 
 # # FlexDTW-Alt
 
-# In[ ]:
+# In[1]:
 
 
 import numpy as np
 from numba import jit
 
 
-# In[ ]:
+# In[2]:
 
 
-try:
-    get_ipython().run_line_magic('matplotlib', 'inline')
-    get_ipython().run_line_magic('load_ext', 'Cython')
-except NameError:
-    pass
+get_ipython().run_line_magic('matplotlib', 'inline')
+get_ipython().run_line_magic('load_ext', 'Cython')
 
 
-# In[ ]:
+# In[3]:
 
 
 @jit(nopython=True)
@@ -96,7 +93,7 @@ def flexdtw_alt(C, steps, weights, buffer=1):
     return best_cost, path, debug, D, B, P
 
 
-# In[ ]:
+# In[4]:
 
 
 @jit(nopython=True)
@@ -153,7 +150,7 @@ def find_best_endpoint(D, P, buffer):
     return best_cost, best_r, best_c, debug
 
 
-# In[ ]:
+# In[5]:
 
 
 @jit(nopython=True)
@@ -189,16 +186,13 @@ def backtrace_flexdtw(D, B, steps, rstart, cstart):
 
 # The code below can be used to run DTW* v0.2a on specific examples, and to visualize the alignments.
 
-# In[ ]:
+# In[6]:
 
 
-try:
-    get_ipython().run_line_magic('matplotlib', 'inline')
-except NameError:
-    pass
+get_ipython().run_line_magic('matplotlib', 'inline')
 
 
-# In[ ]:
+# In[7]:
 
 
 import matplotlib.pyplot as plt
@@ -206,7 +200,7 @@ import time
 import pandas as pd
 
 
-# In[ ]:
+# In[8]:
 
 
 def L2norm(F):
@@ -215,7 +209,7 @@ def L2norm(F):
     return Fnorm
 
 
-# In[ ]:
+# In[9]:
 
 
 # def getTimestamps(annotfile1, annotfile2):
@@ -227,7 +221,7 @@ def L2norm(F):
 #     return np.array(df_merged['0_x']), np.array(df_merged['0_y'])
 
 
-# In[ ]:
+# In[10]:
 
 
 # def mapFrame(r, c, Dshape, frames=False):
@@ -246,7 +240,7 @@ def L2norm(F):
 #     return val
 
 
-# In[ ]:
+# In[11]:
 
 
 # pieceid1 = 'Chopin_Op017No4_Beliavsky-2004_pid9152-13'
@@ -267,30 +261,30 @@ def L2norm(F):
 # buffer = 10 # in sec
 
 
-# In[ ]:
+# In[12]:
 
 
-# featfile1 = f'/home/tjtsai/ttmp/Chopin_Mazurkas_features/{type1}/Chopin_Op017No4/{pieceid1}.npy'
-# featfile2 = f'/home/tjtsai/ttmp/Chopin_Mazurkas_features/{type2}/Chopin_Op017No4/{pieceid2}.npy'
+# featfile1 = f'../ttmp/Chopin_Mazurkas_features/{type1}/Chopin_Op017No4/{pieceid1}.npy'
+# featfile2 = f'../ttmp/Chopin_Mazurkas_features/{type2}/Chopin_Op017No4/{pieceid2}.npy'
 # F1 = np.load(featfile1)
 # F2 = np.load(featfile2)
 
 
-# In[ ]:
+# In[13]:
 
 
 # if type1 == 'original':
-#     annotfile1 = f'/home/tjtsai/ttmp/Chopin_Mazurkas_Modified/annotations_beat/Chopin_Op017No4/{pieceid1}.beat'
+#     annotfile1 = f'../ttmp/Chopin_Mazurkas_Modified/annotations_beat/Chopin_Op017No4/{pieceid1}.beat'
 # else:
-#     annotfile1 = f'/home/tjtsai/ttmp/Chopin_Mazurkas_Benchmarks/{type1}/annotations_beat/Chopin_Op017No4/{pieceid1}.beat'
+#     annotfile1 = f'../ttmp/Chopin_Mazurkas_Benchmarks/{type1}/annotations_beat/Chopin_Op017No4/{pieceid1}.beat'
 # if type2 == 'original':
-#     annotfile2 = f'/home/tjtsai/ttmp/Chopin_Mazurkas_Modified/annotations_beat/Chopin_Op017No4/{pieceid2}.beat'
+#     annotfile2 = f'../ttmp/Chopin_Mazurkas_Modified/annotations_beat/Chopin_Op017No4/{pieceid2}.beat'
 # else:
-#     annotfile2 = f'/home/tjtsai/ttmp/Chopin_Mazurkas_Benchmarks/{type2}/annotations_beat/Chopin_Op017No4/{pieceid2}.beat'
+#     annotfile2 = f'../ttmp/Chopin_Mazurkas_Benchmarks/{type2}/annotations_beat/Chopin_Op017No4/{pieceid2}.beat'
 # gt1, gt2 = getTimestamps(annotfile1, annotfile2)
 
 
-# In[ ]:
+# In[14]:
 
 
 # C = 1 - L2norm(F1).T @ L2norm(F2)
@@ -306,7 +300,7 @@ def L2norm(F):
 # plt.axvline(mapFrame(gt1[-1], gt2[-1], (F1.shape[1]*hop_sec, F2.shape[1]*hop_sec)), color='g')
 
 
-# In[ ]:
+# In[15]:
 
 
 # plt.plot(wp[0,:]*hop_sec, wp[1,:]*hop_sec, 'y.')
@@ -318,7 +312,7 @@ def L2norm(F):
 
 # # FlexDTW
 
-# In[ ]:
+# In[16]:
 
 
 @jit(nopython=True)
@@ -381,19 +375,19 @@ def flexdtw(C, steps, weights, buffer = 1):
 
 # Can be used to compare to SubseqDTW and NWTW alignments
 
-# In[ ]:
+# In[17]:
 
 
 #%run _NWTW.ipynb
 
 
-# In[ ]:
+# In[18]:
 
 
 #%run align_tools_cython.ipynb
 
 
-# In[ ]:
+# In[19]:
 
 
 # times = []
@@ -407,7 +401,7 @@ def flexdtw(C, steps, weights, buffer = 1):
 # print("NWTW: %s seconds" % (times[2] - times[1]))
 
 
-# In[ ]:
+# In[20]:
 
 
 # plt.plot(wp1[0,:]*hop_sec, wp1[1,:]*hop_sec, 'r')
@@ -424,7 +418,7 @@ def flexdtw(C, steps, weights, buffer = 1):
 
 # ## CPython Implementation
 
-# In[ ]:
+# In[21]:
 
 
 # %%cython
@@ -717,7 +711,7 @@ def flexdtw(C, steps, weights, buffer = 1):
 #     UNDERLINE = '\033[4m'
 
 
-# In[ ]:
+# In[22]:
 
 
 # def alignFlexDTW2(F1, F2, steps, weights, downsample, buffer=1, C_in=None):
@@ -737,7 +731,7 @@ def flexdtw(C, steps, weights, buffer = 1):
     
 
 
-# In[ ]:
+# In[23]:
 
 
 # %%cython
@@ -903,7 +897,7 @@ def flexdtw(C, steps, weights, buffer = 1):
 #     UNDERLINE = '\033[4m'
 
 
-# In[ ]:
+# In[24]:
 
 
 # def alignFlexDTW2b(F1, F2, steps, weights, downsample, buffer=1, C_in=None):
@@ -923,13 +917,13 @@ def flexdtw(C, steps, weights, buffer = 1):
     
 
 
-# In[ ]:
+# In[25]:
 
 
 # from timeit import default_timer as timer
 
 
-# In[ ]:
+# In[26]:
 
 
 # steps = np.array([1, 1, 1, 2, 2, 1]).reshape((3,2))
@@ -948,7 +942,7 @@ def flexdtw(C, steps, weights, buffer = 1):
 # print("CPython", end_c - start_c)
 
 
-# In[ ]:
+# In[27]:
 
 
 # steps = np.array([1, 1, 1, 2, 2, 1]).reshape((3,2))
@@ -977,7 +971,7 @@ def flexdtw(C, steps, weights, buffer = 1):
 
 
 
-# In[ ]:
+# In[28]:
 
 
 # C = np.random.randint(10, size=(10000,10000))
