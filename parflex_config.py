@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Chunk lengths to run (as in the user request).
 L_VALUES = [
-    4000,6000
+    4000
 ]
 
 # Root directory for saving systems (one subdir per L: experiments_train/sparse_parflex/L_100, ...).
