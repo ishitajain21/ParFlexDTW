@@ -408,6 +408,8 @@ dependencies:
   - pip:
       - audioread==3.0.1
       - cffi==2.0.0
+      - cuda-pathfinder==1.5.2
+      - cupy-cuda12x==14.0.1
       - cryptography==46.0.3
       - cycler==0.12.1
       - dill==0.3.9

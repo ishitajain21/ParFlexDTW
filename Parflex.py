@@ -1,90 +1,201 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Sparse Parallel FlexDTW (Numba-optimized)
-#
-# Key changes vs the original sparse implementation:
-#   - D_chunks/L_chunks nested lists → D_arr/L_arr numpy arrays (n_row, n_col, 2, L)
-#   - _build_edge_data: same as dense — compact (n1,n2,2,L) arrays, no full L×L matrices
-#   - _build_valid_mask: converts starts_bot_edge/starts_left_edge Python sets
-#     into a bool mask (n1,n2,2,L) for use inside JIT kernels
-#   - _nb_initialize_chunks_sparse / _nb_dp_fill_chunks_sparse: JIT kernels that
-#     check valid_mask[i,j,edge,pos] and skip positions not needed by any neighbor
-#   - sync_overlapping_positions: @_parflex_dp_njit (identical to dense)
-#   - _nb_scan_edges / _build_edge_lookups: identical to dense
-#   - _nb_backtrace_within_chunk: max_iters = nrows+ncols (not nrows*ncols)
-#   - backtrace_segments=False by default — O(P) instead of O(P²/L)
-#   - Visualization updated to use D_arr instead of D_chunks nested lists
+# # Sparse Parallel FlexDTW
+# 
+# Chunked FlexDTW, sparse edge costs, Stage 2 scan/backtrace (Numba JIT for edge DP, sync, and global-edge scan). Override `DEFAULT_CHUNK_LENGTH` in the next cell or pass `L=` to functions.
+# 
+# **API:** `tiled_stage1_from_features` → `run_stage2_from_tiled`, or `parflex(C, steps, weights, beta)`. Stage 2 returns `D_arr`, `L_arr`, and `edge_lens` (compact arrays); `plot_alignment_with_tile_background` uses these when present. `plot_alignment_with_tile_background` needs `eval_tools` for beat-pair paths.
+# 
 
-# ## Parameters
+# In[ ]:
 
-DEFAULT_CHUNK_LENGTH = 4000
+
+# Sparse parallel FlexDTW — tiling, edge DP, Stage 2 backtrace (Numba-optimized)
+DEFAULT_CHUNK_LENGTH = 6000
 
 import os
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['NUMEXPR_NUM_THREADS'] = '1'
-os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
-import time
-import gc
 import csv
+import gc
 import math
+import time
+
+import FlexDTW
+import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
 from numba import njit as _numba_njit
 
 
 def _parflex_njit(f):
-    """Fast JIT for small pure-numeric helpers."""
+    """Wrap helper kernels with the fast Numba profile.
+    
+    Use this for small numeric utilities where speed matters and strict IEEE edge
+    behavior is not critical. If you hit numerical instability, switch that kernel
+    to _parflex_dp_njit instead.
+    """
     return _numba_njit(cache=False, fastmath=True)(f)
 
 
 def _parflex_dp_njit(f):
-    """JIT for DP kernels: fastmath disabled to preserve inf/nan semantics."""
+    """Wrap DP kernels with conservative Numba settings.
+    
+    This keeps inf/nan semantics predictable, which the sparse DP logic depends on.
+    Change this only if you are validating numerical behavior end-to-end.
+    """
     return _numba_njit(cache=False, fastmath=False)(f)
 
 
-# ---------------------------------------------------------------------------
-# Visualization
-# ---------------------------------------------------------------------------
-
-def plot_parflex_with_chunk_S_background(
-    tiled_result, C_global, flex_wp, parflex_res,
-    ground_truth_=None, xy=None, chunk_length=None,
-    use_valid_edges_only=True, extra_paths=None, extra_labels=None,
-):
+def _profiling_enabled(profile_dir):
+    """Return whether profiling CSV output should be emitted.
+    
+    Set profile_dir to None to disable all profiling writes quickly.
     """
-    Plot FlexDTW vs ParFlex paths. Background: chunk S start→edge segments.
-    Updated to read D_arr[i,j,edge,idx] (numpy array) instead of D_chunks nested lists.
+    return profile_dir is not None
 
-    ground_truth_ : tuple of two .beat annotation file paths.
-    xy            : (N,2) array of ground-truth correspondences in frame space.
-    chunk_length  : used for grid lines; if None, uses tiled_result['L_block'].
+
+def _open_profile_csv(profile_dir, filename, header):
+    """Open a profiling CSV and write its header row.
+    
+    This is the canonical place to change profile file layout or add new columns.
+    """
+    if not _profiling_enabled(profile_dir):
+        return None, None
+    os.makedirs(profile_dir, exist_ok=True)
+    fp = open(os.path.join(profile_dir, filename), "w", newline="")
+    writer = csv.writer(fp)
+    writer.writerow(header)
+    fp.flush()
+    return fp, writer
+
+
+def _close_profile_csv(profile_fp):
+    """Close a profiling file handle if one was opened.
+    
+    Kept as a helper so call sites can stay clean and uniform.
+    """
+    if profile_fp is not None:
+        profile_fp.close()
+
+
+def _start_profile_timer(enabled, collect_gc=False):
+    """Start a wall-clock timer for a profiled section.
+    
+    collect_gc=True forces a GC pass to reduce run-to-run noise before timing.
+    """
+    if not enabled:
+        return None
+    if collect_gc:
+        gc.collect()
+    return time.perf_counter()
+
+
+def _elapsed_profile_seconds(start_time):
+    """Convert a start timestamp into (start, end, elapsed).
+    
+    Returns triple None when timing was disabled so callers can branch uniformly.
+    """
+    if start_time is None:
+        return None, None, None
+    end_time = time.perf_counter()
+    return start_time, end_time, end_time - start_time
+
+
+def _write_profile_rows(profile_dir, filename, header, rows):
+    """Write a complete profiling table in one call.
+    
+    Use this for batch profile outputs when row-by-row streaming is unnecessary.
+    """
+    if not _profiling_enabled(profile_dir):
+        return
+    os.makedirs(profile_dir, exist_ok=True)
+    with open(os.path.join(profile_dir, filename), "w", newline="") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(header)
+        for row in rows:
+            writer.writerow(row)
+
+
+# Sparse parallel FlexDTW — tiling, edge DP, Stage 2 backtrace
+DEFAULT_CHUNK_LENGTH = 4000
+
+import csv
+import gc
+import math
+import os
+import time
+
+import FlexDTW
+import matplotlib.pyplot as plt
+import numpy as np
+import plotly.graph_objects as go
+
+def edge_slot_to_local(edge_type, position, chunk_shape):
+    """Map a compact edge slot to local chunk coordinates.
+    
+    Edge 0 indexes the top boundary (last row in this orientation), and edge 1
+    indexes the right boundary. Update this if edge orientation conventions change.
+    """
+    if edge_type == 0:
+        return chunk_shape[0] - 1, position
+    return position, chunk_shape[1] - 1
+
+
+def _edge_length_for_chunk_edge(chunk_shape, edge_type):
+    """Return the number of valid positions on one chunk edge.
+    
+    Keep this consistent with edge_slot_to_local and all edge_lens allocations.
+    """
+    return chunk_shape[1] if edge_type == 0 else chunk_shape[0]
+
+def plot_alignment_with_tile_background(
+    tiled_result,
+    cost_matrix,
+    flex_wp,
+    stage2_result,
+    beat_pair_paths=None,
+    xy=None,
+    chunk_length=None,
+    use_valid_edges_only=True,
+):
+    """Visualize global alignment paths with tile-level context overlays.
+    
+    Shows: dense FlexDTW path, stitched Parflex path, optional ground-truth markers,
+    and faint S-derived start-to-edge segments for debugging. Edit this when you
+    need new diagnostics or plotting conventions, not algorithm behavior.
     """
     SR, HOP = 22050, 512
-    if ground_truth_ is not None:
-        beat_path_1, beat_path_2 = ground_truth_
+
+    if beat_pair_paths is not None:
+        beat_path_1, beat_path_2 = beat_pair_paths
         import eval_tools
         gt_seconds = eval_tools.getGroundTruthTimestamps(beat_path_1, beat_path_2)
         xy = gt_seconds.copy()
         xy[:, 0] = xy[:, 0] * SR / HOP
         xy[:, 1] = xy[:, 1] * SR / HOP
 
-    blocks   = tiled_result['blocks']
-    L_block  = tiled_result['L_block']
-    L_div    = chunk_length if chunk_length is not None else L_block
-    D_arr    = parflex_res.get('D_arr', None)
-    edge_lens_arr = parflex_res.get('edge_lens', None)
-    D_chunks = parflex_res.get('D_chunks', None)   # legacy fallback
-    n_row, n_col = parflex_res['n_row'], parflex_res['n_col']
+    blocks = tiled_result['blocks']
+    L_block = tiled_result['L_block']
+    L_div = chunk_length if chunk_length is not None else L_block
+    hop = tiled_result['hop']
+    n_row, n_col = stage2_result['n_row'], stage2_result['n_col']
+    D_arr = stage2_result.get('D_arr')
+    edge_lens_arr = stage2_result.get('edge_lens')
+    D_chunks = stage2_result.get('D_chunks')
 
-    L1, L2 = C_global.shape
-    scale  = 900 / max(L1, L2)
-    fig_width  = int(max(L2 * scale, 400))
+    L1, L2 = cost_matrix.shape
+    base_px = 900
+    max_side = max(L1, L2)
+    scale = base_px / max_side
+    fig_width = int(max(L2 * scale, 400))
     fig_height = int(max(L1 * scale, 400))
+
     fig = go.Figure()
 
     x_S, y_S = [], []
@@ -94,12 +205,13 @@ def plot_parflex_with_chunk_S_background(
         i, j = b['bi'], b['bj']
         if i >= n_row or j >= n_col:
             continue
+
         S_single = b['S_single']
         rows, cols = b['Ck_shape']
         r_start, r_end = b['rows']
         c_start, c_end = b['cols']
 
-        for edge in (0, 1):
+        for edge in (0, 1):  # 0=top edge, 1=right edge
             if edge_lens_arr is not None:
                 edge_len = int(edge_lens_arr[i, j, edge])
             else:
@@ -116,132 +228,157 @@ def plot_parflex_with_chunk_S_background(
                     if not np.isfinite(D_val) or D_val >= INF:
                         continue
 
-                lr = rows - 1 if edge == 0 else idx
-                lc = idx     if edge == 0 else cols - 1
+                lr, lc = edge_slot_to_local(edge, idx, (rows, cols))
                 if lr < 0 or lc < 0 or lr >= rows or lc >= cols:
                     continue
 
                 s_val = S_single[lr, lc]
                 if s_val > 0:
-                    slr, slc = 0, int(s_val)
+                    start_local_r, start_local_c = 0, int(s_val)
                 elif s_val < 0:
-                    slr, slc = abs(int(s_val)), 0
+                    start_local_r, start_local_c = abs(int(s_val)), 0
                 else:
-                    slr, slc = 0, 0
-
-                g0r, g0c = r_start + slr, c_start + slc
-                g1r, g1c = r_start + lr,  c_start + lc
-                if not (0 <= g0r < L1 and 0 <= g0c < L2): continue
-                if not (0 <= g1r < L1 and 0 <= g1c < L2): continue
-                x_S.extend([g0c, g1c, None])
-                y_S.extend([g0r, g1r, None])
+                    start_local_r, start_local_c = 0, 0
+                g_start_r = r_start + start_local_r
+                g_start_c = c_start + start_local_c
+                g_end_r   = r_start + lr
+                g_end_c   = c_start + lc
+                if not (0 <= g_start_r < L1 and 0 <= g_start_c < L2):
+                    continue
+                if not (0 <= g_end_r < L1 and 0 <= g_end_c < L2):
+                    continue
+                x_S.extend([g_start_c, g_end_c, None])
+                y_S.extend([g_start_r, g_end_r, None])
 
     if x_S:
-        fig.add_trace(go.Scattergl(x=x_S, y=y_S, mode="lines",
-            name="Chunk S start→edge segments",
-            line=dict(width=1, color="rgba(100,100,100,0.02)"), showlegend=False))
-
-    sw = parflex_res['stitched_wp']
-    if sw.size > 0:
-        fig.add_trace(go.Scattergl(x=sw[:, 1], y=sw[:, 0], mode="lines",
-            name="ParFlex stitched (global best)",
-            line=dict(width=6, color="rgba(247,14,14,0.5)")))
-
-    for (edge_name, seg_idx), info in parflex_res['paths_per_segment'].items():
-        path = np.array(info['path'], dtype=int)
-        if path.size == 0: continue
-        fig.add_trace(go.Scattergl(x=path[:, 1], y=path[:, 0], mode="lines",
-            name=f"{edge_name} seg={seg_idx}",
-            line=dict(width=3, color="rgba(0,128,255,0.5)"), showlegend=False))
+        fig.add_trace(
+            go.Scattergl(
+                x=x_S,
+                y=y_S,
+                mode="lines",
+                name="Chunk S start→edge segments",
+                line=dict(width=1, color="rgba(100,100,100,0.02)"),  # light grey-ish
+                showlegend=False)
+        )
 
     flex_wp = np.asarray(flex_wp)
-    if flex_wp.size > 0:
-        f1f = flex_wp[:, 0] if flex_wp.shape[1] == 2 else flex_wp[0]
-        f2f = flex_wp[:, 1] if flex_wp.shape[1] == 2 else flex_wp[1]
-        fig.add_trace(go.Scattergl(x=f2f, y=f1f, mode="lines",
-            name="Global FlexDTW", line=dict(width=4, color="rgba(0,0,0,1)")))
+    if flex_wp.shape[1] == 2:
+        f1_frames = flex_wp[:, 0]
+        f2_frames = flex_wp[:, 1]
+    elif flex_wp.shape[0] == 2:
+        f1_frames = flex_wp[0, :]
+        f2_frames = flex_wp[1, :]
+    else:
+        raise ValueError(f"Unexpected flex_wp shape: {flex_wp.shape}")
 
-    if extra_paths is not None:
-        items = extra_paths.items() if isinstance(extra_paths, dict) else \
-                zip(extra_labels or [f"Path {k}" for k in range(len(extra_paths))], extra_paths)
-        for label, path in items:
-            pa = np.asarray(path)
-            if pa.ndim != 2: continue
-            r = pa[:, 0] if pa.shape[1] == 2 else pa[0]
-            c = pa[:, 1] if pa.shape[1] == 2 else pa[1]
-            fig.add_trace(go.Scattergl(x=c, y=r, mode="lines", name=str(label),
-                                        line=dict(width=3)))
+    fig.add_trace(
+        go.Scattergl(
+            x=f2_frames,
+            y=f1_frames,
+            mode="lines",
+            name="Global FlexDTW",
+            line=dict(width=4, color="rgba(0,0,0,1)")
+        )
+    )
+
+    stitched_wp = stage2_result['stitched_wp']
+    if stitched_wp.size > 0:
+        fig.add_trace(
+            go.Scattergl(
+                x=stitched_wp[:, 1],   # cols (F2)
+                y=stitched_wp[:, 0],   # rows (F1)
+                mode="lines",
+                name="Parflex",
+                line=dict(width=6, color="rgba(247,14,14,0.5)")
+            )
+        )
 
     if xy is not None:
         xy_arr = np.asarray(xy)
-        fig.add_trace(go.Scattergl(x=xy_arr[:, 1], y=xy_arr[:, 0], mode="markers",
-            name="Ground Truth", marker=dict(size=5, color="rgba(0,200,0,0.9)")))
 
-    x_lo, x_hi, y_lo, y_hi = -0.5, L2 - 0.5, -0.5, L1 - 0.5
+        if xy_arr.ndim != 2 or xy_arr.shape[1] != 2:
+            raise ValueError(f"xy must have shape (N,2), got {xy_arr.shape}")
+
+        xy_frames = xy
+
+        fig.add_trace(
+            go.Scattergl(
+                x=xy_frames[:, 1],   # F2 frames
+                y=xy_frames[:, 0],   # F1 frames
+                mode="markers",
+                name="Ground Truth",
+                marker=dict(size=5, color="rgba(0,200,0,0.9)")
+            )
+        )
+    x_lo, x_hi = -0.5, L2 - 0.5
+    y_lo, y_hi = -0.5, L1 - 0.5
+
     fig.update_layout(
-        title="Global FlexDTW vs Sparse ParFlex",
-        xaxis_title=f"F2 frames (0…{L2-1})", yaxis_title=f"F1 frames (0…{L1-1})",
+        title="Global FlexDTW vs Parflex (with chunk-S spiky background)",
+        xaxis_title=f"F2 frames (0 … {L2-1})",
+        yaxis_title=f"F1 frames (0 … {L1-1})",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-        width=fig_width, height=fig_height,
-        plot_bgcolor="white", paper_bgcolor="white",
+        width=fig_width,
+        height=fig_height,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
     )
+
     fig.update_xaxes(range=[x_lo, x_hi], showgrid=False)
     fig.update_yaxes(range=[y_lo, y_hi], showgrid=False)
     shapes = []
     for x in range(L_div, L2, L_div):
-        shapes.append(dict(type="line", x0=x, x1=x, y0=y_lo, y1=y_hi, line=dict(width=1)))
+        shapes.append(dict(
+            type="line",
+            x0=x, x1=x,
+            y0=y_lo, y1=y_hi,
+            line=dict(width=1)
+        ))
     for y in range(L_div, L1, L_div):
-        shapes.append(dict(type="line", x0=x_lo, x1=x_hi, y0=y, y1=y, line=dict(width=1)))
+        shapes.append(dict(
+            type="line",
+            x0=x_lo, x1=x_hi,
+            y0=y, y1=y,
+            line=dict(width=1)
+        ))
     fig.update_layout(shapes=shapes)
     fig.show()
 
-
-# ---------------------------------------------------------------------------
-# Chunking helpers
-# ---------------------------------------------------------------------------
-
-def _start_points_from_S(S):
-    """
-    Scan only the last row and last column of S to find unique path-start positions
-    for top and right edges respectively.
-
-    Returns
-    -------
-    starts_bot_edge  : set of int  — col indices where top-edge paths started at row 0
-    starts_left_edge : set of int  — row indices where right-edge paths started at col 0
+def _edge_starts_from_S(S):
+    """Extract boundary start indices from a chunk S matrix.
+    
+    S encodes each cell's local path start; this helper keeps only starts that lie
+    on bottom/left boundaries so neighboring chunks know which edge slots they need.
     """
     rows, cols = S.shape
-    starts_bot_edge  = set()
+    starts_bottom_edge = set()
     starts_left_edge = set()
+    # Top edge: last row S[rows-1, :]
     for c in range(cols):
         val = S[rows - 1, c]
         if val > 0:
-            starts_bot_edge.add(int(val))
+            starts_bottom_edge.add(int(val))
         else:
-            starts_left_edge.add(abs(int(val)))
+            # if starts on left or ==0, then it's a left edge start
+            starts_left_edge.add(abs(int(val)))  # row start; keep for completeness
+    # Right edge: last column S[:, cols-1]
     for r in range(rows):
         val = S[r, cols - 1]
         if val > 0:
-            starts_bot_edge.add(int(val))
+            starts_bottom_edge.add(int(val))
         else:
-            starts_left_edge.add(abs(int(val)))
-    return starts_bot_edge, starts_left_edge
+            # if starts on left or ==0, then it's a left edge start
+            starts_left_edge.add(abs(int(val)))  # row start; keep for completeness
+    
+    return starts_bottom_edge, starts_left_edge
 
 
-def chunk_flexdtw(C, L, steps=None, weights=None, buffer=1, profile_dir='Profiling_results',
+def run_flexdtw_on_tiles(C, L, steps=None, weights=None, buffer=1, profile_dir='Profiling_results',
                   warn_slow_chunks=False, slow_chunk_seconds=1.0):
-    """
-    Tile cost matrix C into overlapping L×L chunks (1-cell overlap), run FlexDTW on each.
-    Stores starts_bot_edge / starts_left_edge per chunk for sparsity.
-    Returns (chunks_dict, L, n_chunks_1, n_chunks_2).
-
-    A FlexDTW warm-up runs before any per-chunk timing or chunk_flexdtw.csv rows, on a
-    matrix with the **same shape as chunk (0,0)** (min(L,L1) × min(L,L2)). A small fixed
-    size (e.g. 128×128) does not warm the large-L Numba path, so chunk (0,0) would still
-    look slow. Two warm calls absorb one-shot overhead after compile.
-
-    If warn_slow_chunks is True, prints a line when a chunk's wall time exceeds
-    slow_chunk_seconds (default 1.0).
+    """Run Stage 1: tile C, execute FlexDTW per tile, collect metadata.
+    
+    This controls chunk geometry, overlap policy, and per-tile artifacts (D/L/B/S).
+    Change this when modifying tiling strategy or what stage-2 data each tile carries.
     """
     if steps is None:
         steps = [(1, 1), (1, 2), (2, 1)]
@@ -254,36 +391,39 @@ def chunk_flexdtw(C, L, steps=None, weights=None, buffer=1, profile_dir='Profili
     n_chunks_2 = math.ceil((L2 - 1) / hop)
     chunks_dict = {}
 
-    # Warm-up only: before profiling opens / perf_counter. Same footprint as chunk (0,0).
-    _warm_h = min(int(L), int(L1))
-    _warm_w = min(int(L), int(L2))
-    if _warm_h >= 4 and _warm_w >= 4:
-        try:
-            import FlexDTW
-            rng = np.random.RandomState(0)
-            C_warm = np.ascontiguousarray(
-                rng.rand(_warm_h, _warm_w).astype(C.dtype, copy=False))
-            for _ in range(2):
-                FlexDTW.flexdtw(C_warm, steps=steps, weights=weights, buffer=1)
-        except ImportError:
-            pass
+    profile_file, _pw = _open_profile_csv(
+        profile_dir,
+        "chunk_flexdtw.csv",
+        ["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"],
+    )
 
-    profile_file = None
-    if profile_dir is not None:
-        os.makedirs(profile_dir, exist_ok=True)
-        profile_file = open(os.path.join(profile_dir, "chunk_flexdtw.csv"), "w", newline="")
-        _pw = csv.writer(profile_file)
-        _pw.writerow(["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"])
-        profile_file.flush()
+    # Warm-up only when profiling is enabled; include it in profiling output.
+    if profile_file is not None:
+        _warm_h = min(int(L), int(L1))
+        _warm_w = min(int(L), int(L2))
+        if _warm_h >= 4 and _warm_w >= 4:
+            warm_start = _start_profile_timer(True, collect_gc=True)
+            try:
+                import FlexDTW
+                rng = np.random.RandomState(0)
+                C_warm = np.ascontiguousarray(
+                    rng.rand(_warm_h, _warm_w).astype(C.dtype, copy=False))
+                for _ in range(2):
+                    FlexDTW.flexdtw(C_warm, steps=steps, weights=weights, buffer=1)
+            except ImportError:
+                pass
+            warm_start, warm_end, warm_elapsed = _elapsed_profile_seconds(warm_start)
+            _pw.writerow(["warmup", "warmup", warm_start, warm_end, warm_elapsed])
+            profile_file.flush()
 
     _time_chunk = profile_file is not None or warn_slow_chunks
 
     for i in range(n_chunks_1):
         for j in range(n_chunks_2):
             if _time_chunk:
-                if profile_file is not None:
-                    gc.collect()
-                t_start = time.perf_counter()
+                t_start = _start_profile_timer(profile_file is not None, collect_gc=True)
+                if t_start is None:
+                    t_start = time.perf_counter()
 
             start_1, start_2 = i * hop, j * hop
             end_1 = min(start_1 + L, L1)
@@ -301,7 +441,7 @@ def chunk_flexdtw(C, L, steps=None, weights=None, buffer=1, profile_dir='Profili
 
             actual_hop_1 = hop if end_1 < L1 else (L1 - start_1)
             actual_hop_2 = hop if end_2 < L2 else (L2 - start_2)
-            starts_bot_edge, starts_left_edge = _start_points_from_S(P)
+            starts_bot_edge, starts_left_edge = _edge_starts_from_S(P)
 
             chunks_dict[(i, j)] = {
                 'C': C_chunk, 'D': D, 'S': P, 'B': B, 'debug': debug,
@@ -314,42 +454,46 @@ def chunk_flexdtw(C, L, steps=None, weights=None, buffer=1, profile_dir='Profili
             }
 
             if _time_chunk:
-                t_end = time.perf_counter()
-                elapsed = t_end - t_start
-                if elapsed > 1:
+                if profile_file is not None:
+                    t_start, t_end, elapsed = _elapsed_profile_seconds(t_start)
+                else:
+                    t_end = time.perf_counter()
+                    elapsed = t_end - t_start
+                if warn_slow_chunks and elapsed > slow_chunk_seconds:
                     print(f"  Warning, chunk ({i},{j}) took {elapsed} seconds")
                 if profile_file is not None:
                     _pw.writerow([i, j, t_start, t_end, elapsed])
                     profile_file.flush()
 
-    if profile_file is not None:
-        profile_file.close()
+    _close_profile_csv(profile_file)
     return chunks_dict, L, n_chunks_1, n_chunks_2
 
 
-# ---------------------------------------------------------------------------
-# Coordinate helpers (same as dense)
-# ---------------------------------------------------------------------------
-
 @_parflex_njit
 def _nb_edge_index_to_local_coords(edge_type, position, nrow, ncol):
+    """Numba helper mapping edge slot to local (row, col).
+    
+    Must stay identical to edge_slot_to_local semantics used in Python code.
+    """
     if edge_type == 0:
         return nrow - 1, position
     return position, ncol - 1
 
-
-def edge_index_to_local_coords(edge_type, position, chunk_shape):
-    nrow, ncol = int(chunk_shape[0]), int(chunk_shape[1])
-    lr, lc = _nb_edge_index_to_local_coords(int(edge_type), int(position), nrow, ncol)
-    return int(lr), int(lc)
-
-
-def local_to_global_coords(chunk_i, chunk_j, local_row, local_col, chunks_dict):
+def local_to_global_cell(chunk_i, chunk_j, local_row, local_col, chunks_dict):
+    """Convert local tile coordinates into global matrix coordinates.
+    
+    Use when stitching paths or resolving cross-tile transitions.
+    """
     start_1, _, start_2, _ = chunks_dict[(chunk_i, chunk_j)]['bounds']
     return start_1 + local_row, start_2 + local_col
 
 
-def global_to_prev_chunk_edge(global_row, global_col, prev_i, prev_j, chunks_dict, L):
+def global_cell_to_prev_tile_edge(global_row, global_col, prev_i, prev_j, chunks_dict, L):
+    """Map a global coordinate onto a predecessor tile edge index.
+    
+    Raises when the point is not on predecessor boundary; this catches broken
+    cross-tile handoff logic early during debugging.
+    """
     start_1, _, start_2, _ = chunks_dict[(prev_i, prev_j)]['bounds']
     local_row = global_row - start_1
     local_col = global_col - start_2
@@ -361,19 +505,12 @@ def global_to_prev_chunk_edge(global_row, global_col, prev_i, prev_j, chunks_dic
     raise ValueError(f"({local_row},{local_col}) not on edge of prev chunk")
 
 
-# ---------------------------------------------------------------------------
-# Build compact edge-indexed arrays (same as dense — reads all positions)
-# ---------------------------------------------------------------------------
 
 def _build_edge_data(chunks_dict, n_chunks_1, n_chunks_2, L):
-    """
-    Precompute per-edge-position data needed for JIT DP kernels.
-    Identical to the dense version — reads D, S, C at every edge position.
-    The valid_mask (built separately) will gate which positions are actually used.
-
-    Returns (edge_Df, edge_start_r, edge_start_c, edge_Cf_olap,
-             edge_lens, chunk_rows, chunk_cols, chunk_bounds, chunk_valid)
-    All float64/int64 numpy arrays.
+    """Materialize compact edge tensors consumed by sparse stage-2 kernels.
+    
+    This is where chunk dictionaries become contiguous arrays for Numba.
+    Edit here when adding/removing edge features used by DP kernels.
     """
     shape4 = (n_chunks_1, n_chunks_2, 2, L)
     edge_Df      = np.full(shape4, np.inf,  dtype=np.float64)
@@ -443,11 +580,10 @@ def _build_edge_data(chunks_dict, n_chunks_1, n_chunks_2, L):
 # ---------------------------------------------------------------------------
 
 def _build_valid_mask(chunks_dict, n_chunks_1, n_chunks_2, L):
-    """
-    Build bool mask (n1, n2, 2, L) marking positions to compute in the sparse DP.
-
-    True  → position is needed by a neighboring chunk or lies on the global boundary edge.
-    False → position can stay inf (no chunk will look it up).
+    """Build sparse compute mask for required edge slots only.
+    
+    Mask rules encode dependency flow between neighboring chunks plus mandatory
+    global-boundary slots. Update this when changing sparsification policy.
     """
     valid_mask = np.zeros((n_chunks_1, n_chunks_2, 2, L), dtype=np.bool_)
 
@@ -496,9 +632,10 @@ def _build_valid_mask(chunks_dict, n_chunks_1, n_chunks_2, L):
 def _nb_initialize_chunks_sparse(edge_Df, edge_start_r, edge_start_c, edge_Cf_olap,
                                   edge_lens, chunk_rows, chunk_cols, chunk_bounds, chunk_valid,
                                   valid_mask, n_chunks_1, n_chunks_2, D_arr, L_arr):
-    """
-    JIT kernel: init D_arr/L_arr for chunk (0,0), first row, first column.
-    Identical logic to the dense kernel but guarded by valid_mask.
+    """Initialize stage-2 DP values for first row/column frontier chunks.
+    
+    These chunks have no full predecessor pair, so they are seeded separately before
+    interior propagation. Modify when changing boundary initialization rules.
     """
     # ── Chunk (0, 0) ─────────────────────────────────────────────────────────
     nrow00 = chunk_rows[0, 0]
@@ -627,9 +764,10 @@ def _nb_initialize_chunks_sparse(edge_Df, edge_start_r, edge_start_c, edge_Cf_ol
 def _nb_dp_fill_chunks_sparse(edge_Df, edge_start_r, edge_start_c, edge_Cf_olap,
                                edge_lens, chunk_rows, chunk_cols, chunk_bounds, chunk_valid,
                                valid_mask, n_chunks_1, n_chunks_2, D_arr, L_arr):
-    """
-    JIT kernel: DP fill for all interior chunks (i>0, j>0).
-    Identical logic to the dense kernel but guarded by valid_mask.
+    """Run sparse stage-2 DP propagation for interior chunks.
+    
+    Consumes edge arrays and valid_mask, writes D_arr/L_arr only for required slots.
+    This is the main kernel to edit for recurrence or transition-cost changes.
     """
     for i in range(n_chunks_1):
         for j in range(n_chunks_2):
@@ -718,14 +856,15 @@ def _nb_dp_fill_chunks_sparse(edge_Df, edge_start_r, edge_start_c, edge_Cf_olap,
 
 
 # ---------------------------------------------------------------------------
-# chunked_flexdtw  (sparse wrapper)
+# propagate_tile_edge_costs  (sparse wrapper — Numba JIT init + DP fill)
 # ---------------------------------------------------------------------------
 
-def chunked_flexdtw(chunks_dict, L, num_chunks_1, num_chunks_2, buffer_param=0.1,
-                    profile_dir='Profiling_results'):
-    """
-    Build compact edge arrays + valid mask, then run JIT sparse init + DP fill.
-    Returns (D_arr, L_arr, edge_lens) each shape (n_row, n_col, 2, L).
+def propagate_tile_edge_costs(chunks_dict, L, num_chunks_1, num_chunks_2, buffer_param=0.1,
+                               profile_dir='Profiling_results'):
+    """High-level stage-2 propagation wrapper.
+    
+    Builds edge tensors + sparse mask, runs initialization and interior DP kernels,
+    then returns compact arrays used by scan/backtrace. Start here for stage-2 tuning.
     """
     (edge_Df, edge_start_r, edge_start_c, edge_Cf_olap,
      edge_lens, chunk_rows, chunk_cols, chunk_bounds, chunk_valid) = \
@@ -737,39 +876,38 @@ def chunked_flexdtw(chunks_dict, L, num_chunks_1, num_chunks_2, buffer_param=0.1
     L_arr = np.full((num_chunks_1, num_chunks_2, 2, L), np.inf, dtype=np.float64)
 
     # ── Init phase ───────────────────────────────────────────────────────────
-    if profile_dir is not None:
-        gc.collect()
-        t0 = time.perf_counter()
+    t0 = _start_profile_timer(_profiling_enabled(profile_dir), collect_gc=True)
 
     _nb_initialize_chunks_sparse(
         edge_Df, edge_start_r, edge_start_c, edge_Cf_olap,
         edge_lens, chunk_rows, chunk_cols, chunk_bounds, chunk_valid,
         valid_mask, num_chunks_1, num_chunks_2, D_arr, L_arr)
 
-    if profile_dir is not None:
-        t1 = time.perf_counter()
-        os.makedirs(profile_dir, exist_ok=True)
-        with open(os.path.join(profile_dir, "initialize_chunks.csv"), "w", newline="") as pf:
-            w = csv.writer(pf)
-            w.writerow(["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"])
-            w.writerow(["all", "all", t0, t1, t1 - t0])
+    if t0 is not None:
+        t0, t1, elapsed = _elapsed_profile_seconds(t0)
+        _write_profile_rows(
+            profile_dir,
+            "initialize_chunks.csv",
+            ["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"],
+            [["all", "all", t0, t1, elapsed]],
+        )
 
     # ── DP fill phase ─────────────────────────────────────────────────────────
-    if profile_dir is not None:
-        gc.collect()
-        t0 = time.perf_counter()
+    t0 = _start_profile_timer(_profiling_enabled(profile_dir), collect_gc=True)
 
     _nb_dp_fill_chunks_sparse(
         edge_Df, edge_start_r, edge_start_c, edge_Cf_olap,
         edge_lens, chunk_rows, chunk_cols, chunk_bounds, chunk_valid,
         valid_mask, num_chunks_1, num_chunks_2, D_arr, L_arr)
 
-    if profile_dir is not None:
-        t1 = time.perf_counter()
-        with open(os.path.join(profile_dir, "dp_fill_chunks.csv"), "w", newline="") as pf:
-            w = csv.writer(pf)
-            w.writerow(["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"])
-            w.writerow(["all", "all", t0, t1, t1 - t0])
+    if t0 is not None:
+        t0, t1, elapsed = _elapsed_profile_seconds(t0)
+        _write_profile_rows(
+            profile_dir,
+            "dp_fill_chunks.csv",
+            ["chunk_i", "chunk_j", "start_time", "end_time", "elapsed_seconds"],
+            [["all", "all", t0, t1, elapsed]],
+        )
 
     return D_arr, L_arr, edge_lens
 
@@ -779,10 +917,11 @@ def chunked_flexdtw(chunks_dict, L, num_chunks_1, num_chunks_2, buffer_param=0.1
 # ---------------------------------------------------------------------------
 
 @_parflex_dp_njit
-def sync_overlapping_positions(D_arr, L_arr, edge_lens, n_chunks_1, n_chunks_2):
-    """
-    Ensure 1-cell overlaps between adjacent chunks share the same D/L values.
-    Operates in-place; returns (D_arr, L_arr).
+def sync_tile_overlap_edges(D_arr, L_arr, edge_lens, n_chunks_1, n_chunks_2):
+    """Force consistency on 1-cell overlaps between neighboring tiles.
+    
+    When two representations refer to the same global cell, keep D/L synchronized to
+    avoid seam artifacts before global edge scanning.
     """
     for i in range(n_chunks_1):
         for j in range(n_chunks_2 - 1):
@@ -837,6 +976,11 @@ def sync_overlapping_positions(D_arr, L_arr, edge_lens, n_chunks_1, n_chunks_2):
 @_parflex_njit
 def _nb_backtrace_within_chunk(B_single, steps, start_r, start_c, end_r, end_c,
                                global_r_offset, global_c_offset):
+    """Backtrace one intra-chunk path segment using B and steps.
+    
+    Walks from selected edge endpoint back to that segment start and emits globalized
+    coordinates. If path rules change, keep this aligned with stage-1 step encoding.
+    """
     nrows, ncols = B_single.shape
     nsteps = steps.shape[0]
     max_iters = nrows + ncols   # tight bound: every step decreases r by ≥1
@@ -868,12 +1012,106 @@ def _nb_backtrace_within_chunk(B_single, steps, start_r, start_c, end_r, end_c,
     return out[:k]
 
 
+def _stage2_edge_to_local(edge, idx, rows, cols):
+    """Python wrapper for stage-2 edge-slot to local-coordinate mapping.
+    """
+    lr, lc = _nb_edge_index_to_local_coords(int(edge), int(idx), int(rows), int(cols))
+    return int(lr), int(lc)
+
+
+def _stage2_chunk_path_points(B_single, steps, start_r, start_c, end_r, end_c, gro, gco):
+    """Return a Python list of global points for one chunk backtrace segment.
+    """
+    out = _nb_backtrace_within_chunk(
+        np.ascontiguousarray(B_single),
+        np.ascontiguousarray(steps, dtype=np.int64),
+        int(start_r), int(start_c), int(end_r), int(end_c), int(gro), int(gco))
+    return [(int(out[k, 0]), int(out[k, 1])) for k in range(out.shape[0])]
+
+
+def backtrace_and_stitch(tiled_result, chunks_dict, start_i, start_j, start_edge, start_idx):
+    """Follow predecessor tiles and stitch chunk segments into one global path.
+    
+    This enforces cross-tile predecessor routing (up, left, or diagonal corner case).
+    Edit this when changing stage-2 predecessor selection or stitch ordering.
+    """
+    path = []
+    cur_i, cur_j, cur_edge, cur_idx = start_i, start_j, start_edge, start_idx
+    steps = tiled_result['stage1_params']['steps']
+    visited = set()
+
+    for _ in range(101):
+        chunk_key = (cur_i, cur_j, cur_edge, cur_idx)
+        if chunk_key in visited:
+            break
+        visited.add(chunk_key)
+        if (cur_i, cur_j) not in chunks_dict:
+            break
+
+        b = chunks_dict[(cur_i, cur_j)]
+        rows, cols = b['shape']
+        r_start, r_end, c_start, c_end = b['bounds']
+
+        end_r, end_c = _stage2_edge_to_local(cur_edge, cur_idx, rows, cols)
+        S_val = b['S'][end_r, end_c]
+
+        if S_val >= 0:
+            start_r, start_c = 0, int(S_val)
+        else:
+            start_r, start_c = int(-S_val), 0
+
+        for pt in _stage2_chunk_path_points(
+                b['B'], steps, start_r, start_c, end_r, end_c, r_start, c_start):
+            if not path or path[-1] != pt:
+                path.append(pt)
+
+        g_start_row = r_start + start_r
+        g_start_col = c_start + start_c
+        if g_start_row == 0 or g_start_col == 0:
+            break
+
+        corner_landed = (start_r == 0 and start_c == 0)
+        if corner_landed:
+            prev_i, prev_j, prev_edge = cur_i - 1, cur_j - 1, 0
+        elif S_val >= 0:
+            prev_i, prev_j, prev_edge = cur_i - 1, cur_j, 0
+        else:
+            prev_i, prev_j, prev_edge = cur_i, cur_j - 1, 1
+
+        if prev_i < 0 or prev_j < 0:
+            break
+        if (prev_i, prev_j) not in chunks_dict:
+            break
+
+        prev_b = chunks_dict[(prev_i, prev_j)]
+        prev_r_start, _, prev_c_start, _ = prev_b['bounds']
+        prev_rows, prev_cols = prev_b['shape']
+
+        if corner_landed:
+            prev_idx = prev_cols - 1
+            max_prev_idx = prev_cols
+        else:
+            prev_lr = g_start_row - prev_r_start
+            prev_lc = g_start_col - prev_c_start
+            prev_idx = prev_lc if prev_edge == 0 else prev_lr
+            max_prev_idx = prev_cols if prev_edge == 0 else prev_rows
+
+        if prev_idx < 0 or prev_idx >= max_prev_idx:
+            break
+        cur_i, cur_j, cur_edge, cur_idx = prev_i, prev_j, prev_edge, prev_idx
+
+    return path[::-1]
+
+
 # ---------------------------------------------------------------------------
 # Edge scan (identical to dense)
 # ---------------------------------------------------------------------------
 
 def _build_edge_lookups(chunks_dict, L1, L2):
-    """Precompute O(1) lookup arrays for global top and right edge positions."""
+    """Precompute global-boundary lookup tables for O(1) edge access.
+    
+    Maps each global top/right position to the owning tile edge slot used in stage 2.
+    """
     top_ci  = np.full(L2, -1, dtype=np.int64); top_cj  = np.full(L2, -1, dtype=np.int64)
     top_et  = np.full(L2, -1, dtype=np.int64); top_idx = np.full(L2, -1, dtype=np.int64)
     right_ci  = np.full(L1, -1, dtype=np.int64); right_cj  = np.full(L1, -1, dtype=np.int64)
@@ -922,6 +1160,11 @@ def _nb_scan_edges(D_arr, L_arr, edge_lens,
                    seg_best_ci, seg_best_cj, seg_best_et, seg_best_idx,
                    seg_best_grow, seg_best_gcol,
                    best_out):
+    """Scan global top/right boundaries for best normalized terminal candidate.
+    
+    Also records per-segment winners for optional diagnostics/visualization. Adjust
+    this when changing terminal objective (for example cost/length formulation).
+    """
     LARGE = 1e9
     best_norm = LARGE
     best_out[6] = 0
@@ -980,56 +1223,16 @@ def _nb_scan_edges(D_arr, L_arr, edge_lens,
 
 
 # ---------------------------------------------------------------------------
-# Tiled result (same fields as original sparse, adds B to each block)
-# ---------------------------------------------------------------------------
-
-def convert_chunks_to_tiled_result(chunks_dict, L, n_chunks_1, n_chunks_2, C, stage1_params=None):
-    L1, L2 = C.shape
-    blocks = []
-    for (i, j), ch in chunks_dict.items():
-        s1, e1, s2, e2 = ch['bounds']
-        rows, cols = ch['shape']
-        wp_local = np.array(ch['wp'])
-        if wp_local.size == 0:
-            continue
-        blocks.append({
-            'bi': i, 'bj': j,
-            'rows': (int(s1), int(e1)),
-            'cols': (int(s2), int(e2)),
-            'bounds': (s1, e1, s2, e2),
-            'Ck_shape': (rows, cols),
-            'shape':    (rows, cols),
-            'S_single': ch['S'],
-            'S':        ch['S'],
-            'B':        ch['B'],
-        })
-    if stage1_params is None:
-        stage1_params = {
-            'steps':   np.array([[1, 1], [1, 2], [2, 1]], dtype=int),
-            'weights': np.array([1.5, 3.0, 3.0], dtype=float),
-            'buffer':  1.0,
-        }
-    return {
-        'C_shape': (L1, L2), 'L_block': L, 'hop': L - 1,
-        'n_row': n_chunks_1, 'n_col': n_chunks_2,
-        'blocks': blocks, 'C': C, 'stage1_params': stage1_params,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Stage 2 backtrace
 # ---------------------------------------------------------------------------
 
-def stage_2_backtrace_compatible(tiled_result, chunks_dict, D_arr, L_arr, edge_lens,
+def stage2_scan_and_stitch(tiled_result, chunks_dict, D_arr, L_arr, edge_lens,
                                   L1, L2, L_block, buffer_stage2=200, top_k=1,
                                   profile_dir='Profiling_results',
                                   backtrace_segments=False):
-    """
-    Scan top/right global edges (JIT), then backtrace and stitch (Python).
-
-    backtrace_segments : bool, default False
-        False → only backtrace the global-best path (O(P)).
-        True  → also backtrace per-segment bests for visualization (O(P²/L)).
+    """Choose best terminal edge candidate, then reconstruct stitched path.
+    
+    This is the stage-2 orchestration point after propagation/synchronization.
     """
     n_row = tiled_result['n_row']
     n_col = tiled_result['n_col']
@@ -1060,9 +1263,8 @@ def stage_2_backtrace_compatible(tiled_result, chunks_dict, D_arr, L_arr, edge_l
 
     _profile_rows = []
 
-    if profile_dir is not None:
-        gc.collect()
-        _t0 = time.perf_counter()
+    profile_enabled = _profiling_enabled(profile_dir)
+    _t0 = _start_profile_timer(profile_enabled, collect_gc=True)
 
     best_norm = _nb_scan_edges(
         D_arr, L_arr, edge_lens,
@@ -1076,9 +1278,9 @@ def stage_2_backtrace_compatible(tiled_result, chunks_dict, D_arr, L_arr, edge_l
         best_out,
     )
 
-    if profile_dir is not None:
-        _t1 = time.perf_counter()
-        _profile_rows.append(["edge_scan", _t0, _t1, _t1 - _t0])
+    if _t0 is not None:
+        _t0, _t1, elapsed = _elapsed_profile_seconds(_t0)
+        _profile_rows.append(["edge_scan", _t0, _t1, elapsed])
 
     if best_out[6] == 0:
         raise ValueError("Stage 2: No valid endpoint found on global top/right edges.")
@@ -1110,103 +1312,32 @@ def stage_2_backtrace_compatible(tiled_result, chunks_dict, D_arr, L_arr, edge_l
                 'segment':      key,
             }
 
-    # ── Backtrace (Python — closures + sets can't be JIT'd) ──────────────────
-    if profile_dir is not None:
-        gc.collect()
-        _t0 = time.perf_counter()
-
-    def _edge_to_local(edge, idx, rows, cols):
-        lr, lc = _nb_edge_index_to_local_coords(int(edge), int(idx), int(rows), int(cols))
-        return int(lr), int(lc)
-
-    def _backtrace_within_chunk(B_single, steps, start_r, start_c, end_r, end_c, gro, gco):
-        out = _nb_backtrace_within_chunk(
-            np.ascontiguousarray(B_single),
-            np.ascontiguousarray(steps, dtype=np.int64),
-            int(start_r), int(start_c), int(end_r), int(end_c), int(gro), int(gco))
-        return [(int(out[k, 0]), int(out[k, 1])) for k in range(out.shape[0])]
-
-    def backtrace_and_stitch(start_i, start_j, start_edge, start_idx):
-        path = []
-        cur_i, cur_j, cur_edge, cur_idx = start_i, start_j, start_edge, start_idx
-        steps = tiled_result['stage1_params']['steps']
-        visited = set()
-
-        for _ in range(101):
-            chunk_key = (cur_i, cur_j, cur_edge, cur_idx)
-            if chunk_key in visited: break
-            visited.add(chunk_key)
-            if (cur_i, cur_j) not in chunks_dict: break
-
-            b = chunks_dict[(cur_i, cur_j)]
-            rows, cols = b['shape']
-            r_start, r_end, c_start, c_end = b['bounds']
-
-            end_r, end_c = _edge_to_local(cur_edge, cur_idx, rows, cols)
-            S_val = b['S'][end_r, end_c]
-
-            if S_val >= 0: start_r, start_c = 0, int(S_val)
-            else:          start_r, start_c = int(-S_val), 0
-
-            for pt in _backtrace_within_chunk(
-                    b['B'], steps, start_r, start_c, end_r, end_c, r_start, c_start):
-                if not path or path[-1] != pt:
-                    path.append(pt)
-
-            g_start_row = r_start + start_r
-            g_start_col = c_start + start_c
-            if g_start_row == 0 or g_start_col == 0: break
-
-            corner_landed = (start_r == 0 and start_c == 0)
-            if corner_landed:
-                prev_i, prev_j, prev_edge = cur_i - 1, cur_j - 1, 0
-            elif S_val >= 0:
-                prev_i, prev_j, prev_edge = cur_i - 1, cur_j, 0
-            else:
-                prev_i, prev_j, prev_edge = cur_i, cur_j - 1, 1
-
-            if prev_i < 0 or prev_j < 0: break
-            if (prev_i, prev_j) not in chunks_dict: break
-
-            prev_b = chunks_dict[(prev_i, prev_j)]
-            prev_r_start, _, prev_c_start, _ = prev_b['bounds']
-            prev_rows, prev_cols = prev_b['shape']
-
-            if corner_landed:
-                prev_idx = prev_cols - 1; max_prev_idx = prev_cols
-            else:
-                prev_lr = g_start_row - prev_r_start
-                prev_lc = g_start_col - prev_c_start
-                prev_idx     = prev_lc if prev_edge == 0 else prev_lr
-                max_prev_idx = prev_cols if prev_edge == 0 else prev_rows
-
-            if prev_idx < 0 or prev_idx >= max_prev_idx: break
-            cur_i, cur_j, cur_edge, cur_idx = prev_i, prev_j, prev_edge, prev_idx
-
-        return path[::-1]
+    # ── Backtrace (Python — cross-chunk loop; helpers are module-level) ───────
+    _t0 = _start_profile_timer(profile_enabled, collect_gc=True)
 
     paths_per_segment = {}
     if backtrace_segments:
         for seg_key, meta in best_per_segment.items():
-            path = backtrace_and_stitch(meta['chunk_i'], meta['chunk_j'],
+            path = backtrace_and_stitch(tiled_result, chunks_dict,
+                                         meta['chunk_i'], meta['chunk_j'],
                                          meta['edge'], meta['idx'])
             paths_per_segment[seg_key] = {'endpoint': meta, 'path': path}
 
     stitched_wp = np.array([], dtype=int).reshape(0, 2)
     g_row, g_col, best_i, best_j, best_edge, best_idx = best_overall_end
-    best_path = backtrace_and_stitch(best_i, best_j, best_edge, best_idx)
+    best_path = backtrace_and_stitch(tiled_result, chunks_dict, best_i, best_j, best_edge, best_idx)
     if best_path:
         stitched_wp = np.array(best_path, dtype=int)
 
-    if profile_dir is not None:
-        _t1 = time.perf_counter()
-        _profile_rows.append(["backtrace_stitch", _t0, _t1, _t1 - _t0])
-        os.makedirs(profile_dir, exist_ok=True)
-        with open(os.path.join(profile_dir, "stage_2_backtrace_compatible.csv"), "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["phase", "start_time", "end_time", "elapsed_seconds"])
-            for row in _profile_rows:
-                w.writerow(row)
+    if _t0 is not None:
+        _t0, _t1, elapsed = _elapsed_profile_seconds(_t0)
+        _profile_rows.append(["backtrace_stitch", _t0, _t1, elapsed])
+        _write_profile_rows(
+            profile_dir,
+            "stage_2_backtrace_compatible.csv",
+            ["phase", "start_time", "end_time", "elapsed_seconds"],
+            _profile_rows,
+        )
 
     return {
         'D_arr':     D_arr,
@@ -1225,123 +1356,226 @@ def stage_2_backtrace_compatible(tiled_result, chunks_dict, D_arr, L_arr, edge_l
     }
 
 
-# ---------------------------------------------------------------------------
-# Visualization helpers
-# ---------------------------------------------------------------------------
 
-def plot_normalized_global_edge_cost(D_arr, L_arr, edge_lens, num_chunks_1, num_chunks_2):
+def build_tiled_metadata(chunks_dict, L, n_chunks_1, n_chunks_2, C, stage1_params=None):
+    """Convert stage-1 chunk outputs into plotting/stage-2 metadata bundles.
+    
+    Use this adapter if downstream consumers need additional per-block fields.
+    """
+    L1, L2 = C.shape
+    hop = L - 1  # 1-frame overlap
+
+    # Convert chunks dictionary to list of block dicts
+    blocks = []
+
+    for (i, j), chunk_data in chunks_dict.items():
+        # Extract bounds and shape
+        start_1, end_1, start_2, end_2 = chunk_data['bounds']
+        rows, cols = chunk_data['shape']
+
+        # Skip chunks without a valid warping path
+        wp_local = np.array(chunk_data['wp'])
+        if wp_local.size == 0:
+            continue
+
+        block_dict = {
+            'bi': i,
+            'bj': j,
+            'rows': (int(start_1), int(end_1)),
+            'cols': (int(start_2), int(end_2)),
+            'Ck_shape': (rows, cols),
+            'S_single': chunk_data['S'],
+        }
+
+        blocks.append(block_dict)
+
+    # Default stage1 parameters if not provided
+    if stage1_params is None:
+        stage1_params = {
+            'steps': np.array([[1, 1], [1, 2], [2, 1]], dtype=int),
+            'weights': np.array([1.5, 3.0, 3.0], dtype=float),
+            'buffer': 1.0,
+        }
+
+    # Build the tiled_result dictionary
+    tiled_result = {
+        'C_shape': (L1, L2),
+        'L_block': L,
+        'hop': hop,
+        'n_row': n_chunks_1,
+        'n_col': n_chunks_2,
+        'blocks': blocks,
+        'C': C,
+        'stage1_params': stage1_params,
+    }
+
+    return tiled_result
+
+
+def plot_normalized_tile_edge_costs(D_arr, L_arr, edge_lens, num_chunks_1, num_chunks_2):
+    """Plot normalized edge costs along global top and right boundaries.
+    
+    Useful for validating stage-2 terminal selection and spotting weak regions.
+    """
     i_top, j_right = num_chunks_1 - 1, num_chunks_2 - 1
     global_edge_data = []
     for j in range(num_chunks_2):
-        elen  = int(edge_lens[i_top, j, 0])
+        elen = int(edge_lens[i_top, j, 0])
         costs = D_arr[i_top, j, 0, 1:elen]
-        lens  = L_arr[i_top, j, 0, 1:elen]
+        lens = L_arr[i_top, j, 0, 1:elen]
         valid = np.isfinite(costs) & (lens > 0)
-        norm  = np.full_like(costs, np.nan)
+        norm = np.full_like(costs, np.nan)
         norm[valid] = costs[valid] / lens[valid]
-        for v in norm: global_edge_data.append((v, 'Top'))
+        for v in norm:
+            global_edge_data.append((v, "Top"))
     for i in range(num_chunks_1 - 1, -1, -1):
-        elen  = int(edge_lens[i, j_right, 1])
+        elen = int(edge_lens[i, j_right, 1])
         costs = D_arr[i, j_right, 1, 1:elen]
-        lens  = L_arr[i, j_right, 1, 1:elen]
+        lens = L_arr[i, j_right, 1, 1:elen]
         valid = np.isfinite(costs) & (lens > 0)
-        norm  = np.full_like(costs, np.nan)
+        norm = np.full_like(costs, np.nan)
         norm[valid] = costs[valid] / lens[valid]
-        for v in norm[::-1]: global_edge_data.append((v, 'Right'))
-
-    costs      = [d[0] for d in global_edge_data]
+        for v in norm[::-1]:
+            global_edge_data.append((v, "Right"))
+    costs = [d[0] for d in global_edge_data]
     edge_types = [d[1] for d in global_edge_data]
-    top_c   = [costs[k] for k, e in enumerate(edge_types) if e == "Top"]
+    top_c = [costs[k] for k, e in enumerate(edge_types) if e == "Top"]
     right_c = [costs[k] for k, e in enumerate(edge_types) if e == "Right"]
     plt.figure(figsize=(15, 6))
-    plt.plot(np.arange(-len(top_c), 0),         top_c,   label='Global Top',   color='C0', linewidth=2)
-    plt.plot(np.arange(1, len(right_c) + 1), right_c, label='Global Right', color='C3', linewidth=2)
-    plt.axvline(x=0, color='gray', linestyle='--', alpha=0.7, label='Corner (0)')
-    plt.title("Normalized Accumulated Cost along Global Edge")
-    plt.xlabel(f"Edge Position (Total: {len(costs)})"); plt.ylabel("Cost / Length")
-    plt.legend(); plt.grid(True, linestyle=':', alpha=0.6); plt.tight_layout(); plt.show()
+    plt.plot(np.arange(-len(top_c), 0), top_c, label="Global Top Edge", color="C0", linewidth=2)
+    plt.scatter(np.arange(-len(top_c), 0), top_c, color="C0", s=10)
+    plt.plot(np.arange(1, len(right_c) + 1), right_c, label="Global Right Edge", color="C3", linewidth=2)
+    plt.scatter(np.arange(1, len(right_c) + 1), right_c, color="C3", s=10)
+    plt.axvline(x=0, color="gray", linestyle="--", alpha=0.7, label="Corner (0)")
+    plt.title("Normalized Accumulated Cost (Cost / Length) along Global Edge", fontsize=14)
+    plt.xlabel(f"Global Edge Position Index (Total Points: {len(costs)})", fontsize=12)
+    plt.ylabel("Normalized Cost (Accumulated Cost / Path Length)", fontsize=12)
+    plt.legend()
+    plt.grid(True, which="both", linestyle=":", alpha=0.6)
+    plt.tight_layout()
+    plt.show()
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def align_system_sparse_parflex(F1, F2, steps=None, weights=None, beta=0.1, L=None):
-    """Stage 1 only: build C, chunk with FlexDTW, return (C, tiled_result)."""
-    if L is None: L = DEFAULT_CHUNK_LENGTH
-    import FlexDTW
-    C = 1 - FlexDTW.L2norm(F1).T @ FlexDTW.L2norm(F2)
-    steps   = steps   if steps   is not None else np.array([[1, 1], [1, 2], [2, 1]])
-    weights = weights if weights is not None else np.array([1.25, 3.0, 3.0])
-    stage1_params = {'steps': np.array(steps).reshape((-1, 2)),
-                     'weights': np.array(weights), 'buffer': 1.0}
-    chunks_dict, L_out, n1, n2 = chunk_flexdtw(C, L=L, steps=steps, weights=weights, buffer=1)
-    tiled = convert_chunks_to_tiled_result(chunks_dict, L_out, n1, n2, C, stage1_params)
-    tiled['chunks_dict'] = chunks_dict
-    return C, tiled
-
-
-def sparse_parflex_2a(tiled_result, C, beta=0.1, show_fig=False, top_k=1,
-                      profile_dir='Profiling_results', backtrace_segments=False):
+def tiled_stage1_from_features(F1, F2, steps=None, weights=None, beta=0.1, L=None):
+    """Convenience API: features -> cost matrix -> stage-1 tiled results.
+    
+    Adjust this if you want different defaults for chunk length or FlexDTW params.
     """
-    Run Sparse ParFlex Stage 2: propagate costs across chunk edges and backtrace.
+    if L is None:
+        L = DEFAULT_CHUNK_LENGTH
+    C = 1 - FlexDTW.L2norm(F1).T @ FlexDTW.L2norm(F2)
+    steps = steps if steps is not None else np.array([[1, 1], [1, 2], [2, 1]])
+    weights = weights if weights is not None else np.array([1.25, 3.0, 3.0])
+    steps_arr = np.array(steps).reshape((-1, 2))
+    stage1_params = {'steps': steps_arr, 'weights': np.array(weights), 'buffer': 1.0}
+    chunks_dict, L_out, n_chunks_1, n_chunks_2 = run_flexdtw_on_tiles(C, L=L, steps=steps, weights=weights, buffer=1)
+    tiled_result = build_tiled_metadata(
+        chunks_dict, L_out, n_chunks_1, n_chunks_2, C, stage1_params=stage1_params
+    )
+    tiled_result['chunks_dict'] = chunks_dict
+    return C, tiled_result
 
-    backtrace_segments : set True only when you need paths_per_segment for visualization.
+
+def run_stage2_from_tiled(tiled_result, C, beta=0.1, show_fig=False, top_k=1,
+                            profile_dir=None, backtrace_segments=False):
+    """Convenience API: run stage 2 from an existing tiled stage-1 result.
+    
+    Handles propagation, overlap sync, edge scan, and backtrace with optional plots.
     """
     chunks_dict = tiled_result['chunks_dict']
     L1, L2 = C.shape
     L = tiled_result['L_block']
-    n1, n2 = tiled_result['n_row'], tiled_result['n_col']
-
-    D_arr, L_arr, edge_lens = chunked_flexdtw(
-        chunks_dict, L, n1, n2, buffer_param=1, profile_dir=profile_dir)
-    D_arr, L_arr = sync_overlapping_positions(D_arr, L_arr, edge_lens, n1, n2)
-
+    n_chunks_1, n_chunks_2 = tiled_result['n_row'], tiled_result['n_col']
+    D_arr, L_arr, edge_lens = propagate_tile_edge_costs(
+        chunks_dict, L, n_chunks_1, n_chunks_2, buffer_param=1, profile_dir=profile_dir)
+    D_arr, L_arr = sync_tile_overlap_edges(D_arr, L_arr, edge_lens, n_chunks_1, n_chunks_2)
     buffer_global = min(L1, L2) * (1 - (1 - beta) * min(L1, L2) / max(L1, L2))
-    r = stage_2_backtrace_compatible(
+    r = stage2_scan_and_stitch(
         tiled_result, chunks_dict, D_arr, L_arr, edge_lens, L1, L2,
-        L_block=L, buffer_stage2=buffer_global, top_k=top_k,
-        profile_dir=profile_dir, backtrace_segments=backtrace_segments)
-
+        L_block=L, buffer_stage2=buffer_global, top_k=top_k, profile_dir=profile_dir,
+        backtrace_segments=backtrace_segments,
+    )
     if show_fig:
-        plot_normalized_global_edge_cost(D_arr, L_arr, edge_lens, n1, n2)
+        plot_normalized_tile_edge_costs(D_arr, L_arr, edge_lens, n_chunks_1, n_chunks_2)
     return r
 
 
 def parflex(C, steps, weights, beta, L=None, profile_dir='Profiling_results',
-            return_plot_data=False, backtrace_segments=False,
-            warn_slow_chunks=False, slow_chunk_seconds=1.0):
+            backtrace_segments=False, warn_slow_chunks=False, slow_chunk_seconds=1.0):
+    """End-to-end public API for Parflex on a precomputed cost matrix.
+    
+    Use this for normal inference. For experimentation, modify stage behavior in
+    run_flexdtw_on_tiles / propagate_tile_edge_costs / stage2_scan_and_stitch.
     """
-    Run the full Sparse ParFlex pipeline on cost matrix C.
-    Returns (best_cost, wp) where wp has shape (2, N).
-
-    warn_slow_chunks: if True, print when any stage-1 chunk exceeds slow_chunk_seconds.
-    """
-    if L is None: L = DEFAULT_CHUNK_LENGTH
+    if L is None:
+        L = DEFAULT_CHUNK_LENGTH
     L1, L2 = C.shape
     buffer_global = min(L1, L2) * (1 - (1 - beta) * min(L1, L2) / max(L1, L2))
 
-    steps_arr   = np.array(steps).reshape((-1, 2)) if hasattr(steps, '__len__') else np.array(steps)
-    stage1_params = {'steps': steps_arr, 'weights': np.array(weights), 'buffer': 1.0}
+    steps_arr = np.array(steps).reshape((-1, 2)) if hasattr(steps, '__len__') else np.array(steps)
+    weights_arr = np.array(weights)
+    stage1_params = {'steps': steps_arr, 'weights': weights_arr, 'buffer': 1.0}
 
-    chunks_dict, L_out, n1, n2 = chunk_flexdtw(
+    chunks_dict, L_out, n_chunks_1, n_chunks_2 = run_flexdtw_on_tiles(
         C, L=L, steps=steps, weights=weights, buffer=1, profile_dir=profile_dir,
         warn_slow_chunks=warn_slow_chunks, slow_chunk_seconds=slow_chunk_seconds)
-    tiled = convert_chunks_to_tiled_result(chunks_dict, L_out, n1, n2, C, stage1_params)
-    tiled['chunks_dict'] = chunks_dict
+    tiled_result = build_tiled_metadata(
+        chunks_dict, L_out, n_chunks_1, n_chunks_2, C, stage1_params=stage1_params
+    )
 
-    D_arr, L_arr, edge_lens = chunked_flexdtw(
-        chunks_dict, L_out, n1, n2, buffer_param=1, profile_dir=profile_dir)
-    D_arr, L_arr = sync_overlapping_positions(D_arr, L_arr, edge_lens, n1, n2)
+    D_arr, L_arr, edge_lens = propagate_tile_edge_costs(
+        chunks_dict, L_out, n_chunks_1, n_chunks_2, buffer_param=1, profile_dir=profile_dir)
+    D_arr, L_arr = sync_tile_overlap_edges(D_arr, L_arr, edge_lens, n_chunks_1, n_chunks_2)
 
-    r = stage_2_backtrace_compatible(
-        tiled, chunks_dict, D_arr, L_arr, edge_lens, L1, L2,
-        L_block=L, buffer_stage2=buffer_global, top_k=1,
-        profile_dir=profile_dir, backtrace_segments=backtrace_segments)
-
+    r = stage2_scan_and_stitch(
+        tiled_result, chunks_dict, D_arr, L_arr, edge_lens, L1, L2,
+        L_block=L, buffer_stage2=buffer_global, top_k=1, profile_dir=profile_dir,
+        backtrace_segments=backtrace_segments,
+    )
     wp = r["stitched_wp"]
-    wp = wp.T if wp.size > 0 else np.array([[], []], dtype=np.int64)
-
-    if return_plot_data:
-        return r["best_cost"], wp, {'tiled_result': tiled, 'parflex_res': r, 'C': C}
+    if wp.size > 0:
+        wp = wp.T  # (N, 2) -> (2, N)
+    else:
+        wp = np.array([[], []], dtype=np.int64)
     return r["best_cost"], wp
+
+
+# ## Try it
+# 
+# Set `FEATURE_1` and `FEATURE_2` to your `.npy` feature paths (or leave both `None` for a small random demo). Then run the cell below for Stage 1 + Stage 2, global FlexDTW, and the alignment plot.
+# 
+
+# In[ ]:
+
+
+# # --- set paths to your .npy files, or None for a synthetic demo ---
+# FEATURE_1 = "/home/ijain/ttmp/Chopin_Mazurkas_features/matching/Chopin_Op063No3/Chopin_Op063No3_Zak-1951_pid918713-20.npy"
+# FEATURE_2 = "/home/ijain/ttmp/Chopin_Mazurkas_features/matching/Chopin_Op063No3/Chopin_Op063No3_Tomsic-1995_pid9190-09.npy"
+# STEPS = np.array([[1, 1], [1, 2], [2, 1]], dtype=int)
+# WEIGHTS = np.array([1.25, 3.0, 3.0], dtype=float)
+# BETA = 0.1
+
+# if FEATURE_1 and FEATURE_2:
+#     F1 = np.load(FEATURE_1, allow_pickle=True)
+#     F2 = np.load(FEATURE_2, allow_pickle=True)
+# else:
+#     rng = np.random.default_rng(0)
+#     T1, T2, d = 120, 160, 24
+#     F1 = rng.standard_normal((d, T1))
+#     F2 = rng.standard_normal((d, T2))
+
+# C, tiled_result = tiled_stage1_from_features(F1, F2, steps=STEPS, weights=WEIGHTS, beta=BETA)
+# stage2_result = run_stage2_from_tiled(tiled_result, C, beta=BETA, show_fig=False)
+
+# L1, L2 = C.shape
+# buffer_flex = min(L1, L2) * (1 - (1 - BETA) * min(L1, L2) / max(L1, L2))
+# _, global_flex_wp, *_ = FlexDTW.flexdtw(C, steps=STEPS, weights=WEIGHTS, buffer=buffer_flex)
+
+# plot_alignment_with_tile_background(tiled_result, C, global_flex_wp, stage2_result)
+
+
+# In[ ]:
+
+
+
+
