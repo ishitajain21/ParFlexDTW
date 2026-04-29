@@ -13,8 +13,12 @@ from numba import jit
 # In[2]:
 
 
-get_ipython().run_line_magic('matplotlib', 'inline')
-get_ipython().run_line_magic('load_ext', 'Cython')
+try:
+    _ip = get_ipython()
+    _ip.run_line_magic("matplotlib", "inline")
+    _ip.run_line_magic("load_ext", "Cython")
+except NameError:
+    pass
 
 
 # In[3]:
@@ -189,7 +193,10 @@ def backtrace_flexdtw(D, B, steps, rstart, cstart):
 # In[6]:
 
 
-get_ipython().run_line_magic('matplotlib', 'inline')
+try:
+    get_ipython().run_line_magic("matplotlib", "inline")
+except NameError:
+    pass
 
 
 # In[7]:
@@ -1000,8 +1007,12 @@ from numba import jit
 # In[2]:
 
 
-get_ipython().run_line_magic('matplotlib', 'inline')
-get_ipython().run_line_magic('load_ext', 'Cython')
+try:
+    _ip = get_ipython()
+    _ip.run_line_magic("matplotlib", "inline")
+    _ip.run_line_magic("load_ext", "Cython")
+except NameError:
+    pass
 
 
 # In[3]:
@@ -1176,7 +1187,10 @@ def backtrace_flexdtw(D, B, steps, rstart, cstart):
 # In[6]:
 
 
-get_ipython().run_line_magic('matplotlib', 'inline')
+try:
+    get_ipython().run_line_magic("matplotlib", "inline")
+except NameError:
+    pass
 
 
 # In[7]:

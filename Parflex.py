@@ -1362,7 +1362,11 @@ def build_tiled_metadata(chunks_dict, L, n_chunks_1, n_chunks_2, C, stage1_param
     
     Use this adapter if downstream consumers need additional per-block fields.
     """
-    L1, L2 = C.shape
+    if C is None:
+        L1 = max(ch['bounds'][1] for ch in chunks_dict.values())
+        L2 = max(ch['bounds'][3] for ch in chunks_dict.values())
+    else:
+        L1, L2 = C.shape
     hop = L - 1  # 1-frame overlap
 
     # Convert chunks dictionary to list of block dicts
@@ -1483,7 +1487,10 @@ def run_stage2_from_tiled(tiled_result, C, beta=0.1, show_fig=False, top_k=1,
     Handles propagation, overlap sync, edge scan, and backtrace with optional plots.
     """
     chunks_dict = tiled_result['chunks_dict']
-    L1, L2 = C.shape
+    if C is None:
+        L1, L2 = tiled_result['C_shape']
+    else:
+        L1, L2 = C.shape
     L = tiled_result['L_block']
     n_chunks_1, n_chunks_2 = tiled_result['n_row'], tiled_result['n_col']
     D_arr, L_arr, edge_lens = propagate_tile_edge_costs(
